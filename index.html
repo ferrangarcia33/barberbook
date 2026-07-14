@@ -3698,11 +3698,21 @@ function renderAdminAgenda() {
       const doneLabel = doneApptEntry.status === 'late' ? 'Realizada (llegó tarde) ⏰' : doneApptEntry.status === 'no-show' ? 'No se presentó 🚫' : 'Realizada ✓';
       const donePill = doneApptEntry.status === 'no-show' ? 'pill-red' : 'pill-green';
       const cl2 = APP.db.clients.find(c=>c.id===doneApptEntry.clientId);
+      // FIX: la vista Agenda no ofrecía forma de corregir el estado de una cita ya
+      // finalizada (a diferencia de la lista "Citas", que sí tiene el botón "···").
+      // Esto era especialmente grave en días pasados, donde la cita ya fue archivada
+      // en cutHistory y eliminada de APP.db.appointments por checkDailyReset(), así que
+      // usamos un flujo de corrección dedicado (openArchivedCorrectionMenu) que opera
+      // sobre el registro archivado en lugar de sobre APP.db.appointments.
+      const correctionBtn = _viewerMode ? '' : `<button class="btn btn-ghost btn-sm" style="width:auto;padding:2px 10px;font-size:1rem;letter-spacing:2px;border-color:var(--border2);color:var(--text2)" onclick="${doneApptEntry._archived ? `openArchivedCorrectionMenu('${doneApptEntry.id}')` : `openCorrectionMenu('${doneApptEntry.id}')`}">···</button>`;
       html += `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;opacity:0.6">
         <div style="font-family:'Courier New',monospace;font-weight:700;color:var(--text3);font-size:0.9rem;min-width:46px">${slot}</div>
         <div style="flex:1">
           <div style="font-weight:600;font-size:0.9rem;color:var(--text2)">${escHtml(getAdminName(doneApptEntry.clientId,cl2?cl2.phone:'')||doneApptEntry.clientName)}</div>
-          <span class="pill ${donePill}" style="margin-top:2px">${doneLabel}</span>
+          <div style="display:flex;align-items:center;gap:6px;margin-top:2px;flex-wrap:wrap">
+            <span class="pill ${donePill}" style="display:inline-flex">${doneLabel}</span>
+            ${correctionBtn}
+          </div>
         </div>
       </div>`;
     } else if (!isBlocked) {
@@ -4839,6 +4849,83 @@ function apptCard(a, isPast=false) {
     </div>
     ${actions}
   </div>`;
+}
+
+// FIX: soporte para corregir el estado de citas de días pasados que ya fueron
+// archivadas por checkDailyReset() (viven en client.cutHistory, no en
+// APP.db.appointments). openCorrectionMenu() no sirve para estos casos porque
+// busca en APP.db.appointments y no encontraría nada.
+function findArchivedCutEntry(apptId) {
+  for (const client of (APP.db.clients || [])) {
+    const entry = (client.cutHistory || []).find(h => h.apptId === apptId);
+    if (entry) return { client, entry };
+  }
+  return null;
+}
+
+function openArchivedCorrectionMenu(apptId) {
+  const found = findArchivedCutEntry(apptId);
+  if (!found) { showToast('No se encontró el registro', 'error'); return; }
+  const _st = found.entry.status;
+  const btnDone   = _st !== 'done'    ? `<button class="btn btn-ghost" style="border-color:var(--green);color:var(--green)" onclick="closeModal();confirmChangeArchivedStatus('${apptId}','done')">✓ Realizada</button>` : '';
+  const btnLate   = _st !== 'late'    ? `<button class="btn btn-ghost" style="border-color:var(--gold);color:var(--gold)" onclick="closeModal();confirmChangeArchivedStatus('${apptId}','late')">⏰ Llegó tarde</button>` : '';
+  const btnNoShow = _st !== 'no-show' ? `<button class="btn btn-ghost" style="border-color:var(--red);color:var(--red)" onclick="closeModal();confirmChangeArchivedStatus('${apptId}','no-show')">🚫 No llegó</button>` : '';
+  openModal('Corregir estado', `
+    <div style="display:flex;flex-direction:column;gap:10px;padding-top:4px">
+      ${btnDone}${btnLate}${btnNoShow}
+    </div>
+  `);
+}
+
+function confirmChangeArchivedStatus(apptId, newStatus) {
+  const found = findArchivedCutEntry(apptId);
+  if (!found) { showToast('No se encontró el registro', 'error'); return; }
+  const labelMap = { done: 'Realizada', late: 'Llegó tarde', 'no-show': 'No llegó' };
+  const displayName = escHtml(getAdminName(found.client.id, found.client.phone) || found.client.name || '');
+  openModal('Confirmar cambio', `
+    <div style="text-align:center;padding:10px 0 16px">
+      <div style="font-size:2.5rem;margin-bottom:10px">✂️</div>
+      <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:8px">${displayName}</div>
+      <div style="font-size:0.85rem;color:var(--text3);line-height:1.6">¿Cambiar a <strong>${labelMap[newStatus]}</strong>?${newStatus==='done' && found.entry.status==='no-show' ? '<br>Se revertirá la multa aplicada si la hubiera.' : ''}</div>
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-gold" style="flex:1" onclick="closeModal();doChangeArchivedStatus('${apptId}','${newStatus}')">Sí, cambiar</button>
+    </div>
+  `);
+}
+
+function doChangeArchivedStatus(apptId, newStatus) {
+  const found = findArchivedCutEntry(apptId);
+  if (!found) { showToast('No se encontró el registro', 'error'); return; }
+  const { client, entry } = found;
+  const prevStatus = entry.status;
+  if (prevStatus === newStatus) return;
+  // Revertir multa si el estado anterior era no-show y ya no lo es
+  if (prevStatus === 'no-show' && newStatus !== 'no-show' && client.fineAmount > 0) {
+    client.fineAmount = Math.max(0, (client.fineAmount || 0) - 5);
+    if (client.fineAmount === 0) client.pendingFine = false;
+  }
+  // Aplicar multa si el nuevo estado es no-show y antes no lo era
+  if (newStatus === 'no-show' && prevStatus !== 'no-show') {
+    client.pendingFine = true;
+    client.fineAmount = (client.fineAmount || 0) + 5;
+  }
+  entry.status = newStatus;
+  client.totalCuts = (client.cutHistory || []).filter(h => h.status !== 'no-show').length;
+  const dateH = formatDateHuman(entry.date);
+  const msg = newStatus === 'done'
+    ? `✂️ Tu cita del ${dateH} a las ${entry.time} ha sido corregida a <strong>realizada</strong>. ¡Hasta la próxima!`
+    : newStatus === 'no-show'
+      ? `🚫 Tu cita del ${dateH} a las ${entry.time} ha sido corregida a <strong>no te presentaste</strong>. Se aplica <strong>+5€</strong> de multa a tu próximo corte.`
+      : `⏰ Tu cita del ${dateH} a las ${entry.time} ha sido corregida a <strong>llegó tarde</strong>.`;
+  addNotif(client.id, msg, newStatus === 'no-show' ? 'cancel' : '');
+  saveDB();
+  showToast('Estado corregido ✓', 'success');
+  if (APP.isAdmin && APP.currentPage === 'book' && bookState && bookState.step === 4 && bookState.date) {
+    const bc = document.getElementById('bookContainer');
+    if (bc) bc.innerHTML = renderAdminAgenda();
+  }
 }
 
 function openCorrectionMenu(apptId) {
