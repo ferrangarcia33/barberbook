@@ -6,11 +6,12 @@ self.addEventListener('fetch', e => {
 });
 
 self.addEventListener('push', e => {
-  const data = e.data ? e.data.json() : {};
+  let data = {};
+  try { data = e.data ? e.data.json() : {}; } catch(err) { data = {}; }
   const isLateCheck = data.type === 'lateCheck' && !!data.apptId;
   const options = {
     body: (data.body || '').replace(/<[^>]*>/g, ''),
-    icon: '/icon.svg',
+    icon: new URL('icon.svg', self.registration.scope).href,
     tag: isLateCheck ? ('late-check-' + data.apptId) : undefined,
     data: { apptId: data.apptId || null }
   };
@@ -51,5 +52,5 @@ self.addEventListener('notificationclick', e => {
     return;
   }
 
-  e.waitUntil(clients.openWindow('/'));
+  e.waitUntil(clients.openWindow(self.registration.scope));
 });
