@@ -6818,7 +6818,7 @@ function _doRegisterTip(dt, amt, clientId) {
 }
 
 function openRegisterFinePaidModal(preserve) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayStr();
   // Conserva los valores ya introducidos si volvemos de elegir cliente
   const state = preserve || APP._regFineState || { amount: 5, date: today, clientId: '' };
   APP._regFineState = state;
@@ -6858,7 +6858,7 @@ function _saveRegFineState() {
   const dt = document.getElementById('regFineDate').value;
   APP._regFineState = {
     amount: (amt && amt > 0) ? amt : 5,
-    date: dt || new Date().toISOString().slice(0, 10),
+    date: dt || todayStr(),
     clientId: (APP._regFineState && APP._regFineState.clientId) || ''
   };
 }
@@ -6904,7 +6904,7 @@ function openSelectClientForFine() {
 }
 
 function _selectClientForFine(clientId) {
-  if (!APP._regFineState) APP._regFineState = { amount: 5, date: new Date().toISOString().slice(0, 10), clientId: '' };
+  if (!APP._regFineState) APP._regFineState = { amount: 5, date: todayStr(), clientId: '' };
   APP._regFineState.clientId = clientId;
   openRegisterFinePaidModal(APP._regFineState);
 }
