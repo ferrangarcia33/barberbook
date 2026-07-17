@@ -1374,6 +1374,7 @@ let APP = {
     ],
     lateChecks: [],    // {apptId, triggered}
     blockedDays: [],   // ['2026-05-07', ...]
+    blockedSlots: [],  // ['2026-05-07|10:00', ...] — individual blocked hours within an open day
     cancelWaitlist: [], // {id, clientId, clientName, date, ts}
     swapRequests: [],   // {id, fromClientId, fromApptId, toApptId, date, status, ts}
     pushSubscriptions: {}, // {userId: subscriptionJSON}
@@ -1744,6 +1745,7 @@ async function loadDB() {
         oohRequests: safeMergeArr(remote.oohRequests, APP.db.oohRequests),
         lateChecks: safeMergeArr(remote.lateChecks, APP.db.lateChecks),
         blockedDays: safeMergeArr(remote.blockedDays, APP.db.blockedDays),
+        blockedSlots: safeMergeArr(remote.blockedSlots, APP.db.blockedSlots),
         cancelWaitlist: safeMergeArr(remote.cancelWaitlist, APP.db.cancelWaitlist),
         swapRequests: safeMergeArr(remote.swapRequests, APP.db.swapRequests),
         normas: remote.normas || APP.db.normas,
@@ -1785,6 +1787,7 @@ async function _tryLoadLocalBackup() {
       oohRequests: parsed.oohRequests || APP.db.oohRequests || [],
       lateChecks: parsed.lateChecks || APP.db.lateChecks || [],
       blockedDays: parsed.blockedDays || APP.db.blockedDays || [],
+      blockedSlots: parsed.blockedSlots || APP.db.blockedSlots || [],
       cancelWaitlist: parsed.cancelWaitlist || APP.db.cancelWaitlist || [],
       swapRequests: parsed.swapRequests || APP.db.swapRequests || [],
       normas: parsed.normas || APP.db.normas,
@@ -2370,6 +2373,14 @@ function acceptSwap(reqId) {
   // appointment moves from a past hour to a future one and vice versa.
   if (!APP.db.lateChecks) APP.db.lateChecks = [];
   APP.db.lateChecks = APP.db.lateChecks.filter(lc => lc.apptId !== fromAppt.id && lc.apptId !== toAppt.id);
+  // FIX: the late_checks_pending row created at booking time still has the OLD time
+  // baked into fire_at — without this, the server-side automatic push (10 min after
+  // the appt) fires at the pre-swap time instead of the new one. Cancel the stale rows
+  // and reschedule with the now-correct .time for both appointments.
+  _cancelLateCheckPush(fromAppt.id);
+  _cancelLateCheckPush(toAppt.id);
+  _scheduleLateCheckPush(fromAppt);
+  _scheduleLateCheckPush(toAppt);
   // After swap: fromAppt.time = original toAppt time (requester's new time)
   //             toAppt.time  = original fromAppt time (acceptor's new time)
   const acceptorClient = APP.db.clients.find(c => c.id === toAppt.clientId);
@@ -2675,7 +2686,7 @@ function importData(input) {
       }
       // Ensure array fields exist AND are actually arrays (guards against malformed backups)
       ['clients','appointments','notifications','alerts','allowedPhones',
-       'oohRequests','lateChecks','blockedDays','cancelWaitlist','swapRequests'].forEach(k => {
+       'oohRequests','lateChecks','blockedDays','blockedSlots','cancelWaitlist','swapRequests'].forEach(k => {
         if (!Array.isArray(parsed[k])) parsed[k] = [];
       });
       parsed.pushSubscriptions = (parsed.pushSubscriptions && typeof parsed.pushSubscriptions === 'object' && !Array.isArray(parsed.pushSubscriptions)) ? parsed.pushSubscriptions : {};
@@ -3595,6 +3606,8 @@ function renderAdminAgenda() {
   const months = ['ENE','FEB','MAR','ABR','MAY','JUN','JUL','AGO','SEP','OCT','NOV','DIC'];
   const weekDays = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
   const todayD = todayStr();
+  const _nowD = new Date();
+  const nowHM = String(_nowD.getHours()).padStart(2,'0') + ':' + String(_nowD.getMinutes()).padStart(2,'0');
   const tomorrowD = formatDate(new Date(new Date().setDate(new Date().getDate()+1)));
   const dayBadge = dateStr === todayD ? '<span style="font-size:0.6rem;font-weight:700;color:var(--blue);font-family:\'Courier New\',monospace;letter-spacing:0.12em;background:rgba(82,149,224,0.12);border:1px solid rgba(82,149,224,0.3);border-radius:4px;padding:1px 6px;margin-left:6px">HOY</span>'
     : dateStr === tomorrowD ? '<span style="font-size:0.6rem;font-weight:700;color:var(--gold);font-family:\'Courier New\',monospace;letter-spacing:0.12em;background:rgba(201,168,76,0.12);border:1px solid rgba(201,168,76,0.3);border-radius:4px;padding:1px 6px;margin-left:6px">MAÑANA</span>'
@@ -3622,11 +3635,6 @@ function renderAdminAgenda() {
             <div style="font-weight:600;font-size:0.9rem">${escHtml((function(){const cl=APP.db.clients.find(c=>c.id===appt.clientId);return getAdminName(appt.clientId,cl?cl.phone:'')||appt.clientName;})())}</div>
             <span class="pill pill-blue" style="margin-top:2px">Fuera de horario</span>
           </div>
-          <div style="display:flex;gap:6px">
-            ${_viewerMode ? '' : `<div class="appt-btn" title="Añadir al calendario" style="${isCalendarAdded(appt.id)?'color:var(--text3);border-color:var(--border);opacity:0.5':'color:var(--gold);border-color:var(--gold)'}" onclick="(function(btn){var a=APP.db.appointments.find(function(x){return x.id==='${appt.id}'});addToCalendar(a,btn);})(this)">📅</div>`}
-            ${_viewerMode ? '' : `<div class="appt-btn green" title="Realizada" onclick="doneAppt('${appt.id}')">✓</div>
-            <div class="appt-btn" title="Cancelar" onclick="cancelAppt('${appt.id}')">✕</div>`}
-          </div>
         </div>`;
       });
       html += `</div>`;
@@ -3647,6 +3655,7 @@ function renderAdminAgenda() {
 
   html += `<div style="display:flex;flex-direction:column;gap:8px">`;
   allTimes.forEach(slot => {
+    const isPastSlot = dateStr < todayD || (dateStr === todayD && slot < nowHM);
     // OOH slot outside normal schedule
     const oohAppt = oohOutOfSlots.find(a => a.time === slot);
     if (oohAppt) {
@@ -3669,11 +3678,6 @@ function renderAdminAgenda() {
             <div style="font-weight:600;font-size:0.9rem">${_oohName}</div>
             <span class="pill pill-blue" style="margin-top:2px">Fuera de horario</span>
           </div>
-          <div style="display:flex;gap:6px">
-            ${_viewerMode ? '' : `<div class="appt-btn" title="Añadir al calendario" style="${isCalendarAdded(oohAppt.id)?'color:var(--text3);border-color:var(--border);opacity:0.5':'color:var(--gold);border-color:var(--gold)'}" onclick="(function(btn){var a=APP.db.appointments.find(function(x){return x.id==='${oohAppt.id}'});addToCalendar(a,btn);})(this)">📅</div>`}
-            ${_viewerMode ? '' : `<div class="appt-btn green" title="Realizada" onclick="doneAppt('${oohAppt.id}')">✓</div>
-            <div class="appt-btn" title="Cancelar" onclick="cancelAppt('${oohAppt.id}')">✕</div>`}
-          </div>
         </div>`;
       }
       return;
@@ -3689,9 +3693,7 @@ function renderAdminAgenda() {
           <span class="pill pill-gold" style="margin-top:2px">Reservada</span>
         </div>
         <div style="display:flex;gap:6px">
-          ${_viewerMode ? '' : `<div class="appt-btn" title="Añadir al calendario" style="${isCalendarAdded(appt.id)?'color:var(--text3);border-color:var(--border);opacity:0.5':'color:var(--gold);border-color:var(--gold)'}" onclick="(function(btn){var a=APP.db.appointments.find(function(x){return x.id==='${appt.id}'});addToCalendar(a,btn);})(this)">📅</div>`}
-          ${_viewerMode ? '' : `<div class="appt-btn green" title="Realizada" onclick="doneAppt('${appt.id}')">✓</div>
-          <div class="appt-btn" title="Cancelar" onclick="cancelAppt('${appt.id}')">✕</div>`}
+          ${_viewerMode || isPastSlot ? '' : `<button class="btn btn-ghost btn-sm" style="width:auto;padding:4px 10px;font-size:0.75rem;border-color:var(--border2);color:var(--text2)" onclick="confirmBlockSlot('${dateStr}','${slot}')">Bloquear</button>`}
         </div>
       </div>`;
     } else if (doneApptEntry) {
@@ -3716,10 +3718,21 @@ function renderAdminAgenda() {
         </div>
       </div>`;
     } else if (!isBlocked) {
-      html += `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px dashed var(--border2);border-radius:10px">
-        <div style="font-family:'Courier New',monospace;font-weight:700;color:var(--text3);font-size:0.9rem;min-width:46px">${slot}</div>
-        <div style="flex:1;color:var(--text3);font-size:0.85rem">— Libre</div>
-      </div>`;
+      const slotKey = dateStr + '|' + slot;
+      const isSlotBlocked = APP.db.blockedSlots && APP.db.blockedSlots.includes(slotKey);
+      if (isSlotBlocked) {
+        html += `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--red-dim);border:1px solid var(--red);border-radius:10px">
+          <div style="font-family:'Courier New',monospace;font-weight:700;color:var(--red);font-size:0.9rem;min-width:46px">${slot}</div>
+          <div style="flex:1;color:var(--red);font-size:0.85rem">🚫 Hora bloqueada</div>
+          ${_viewerMode ? '' : `<button class="btn btn-ghost btn-sm" style="width:auto;padding:4px 10px;font-size:0.75rem;border-color:var(--text3);color:var(--text3)" onclick="confirmUnblockSlot('${dateStr}','${slot}')">Desbloquear</button>`}
+        </div>`;
+      } else {
+        html += `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px dashed var(--border2);border-radius:10px">
+          <div style="font-family:'Courier New',monospace;font-weight:700;color:var(--text3);font-size:0.9rem;min-width:46px">${slot}</div>
+          <div style="flex:1;color:var(--text3);font-size:0.85rem">— Libre</div>
+          ${_viewerMode || isPastSlot ? '' : `<button class="btn btn-ghost btn-sm" style="width:auto;padding:4px 10px;font-size:0.75rem;border-color:var(--border2);color:var(--text2)" onclick="confirmBlockSlot('${dateStr}','${slot}')">Bloquear</button>`}
+        </div>`;
+      }
     }
   });
   html += `</div>`;
@@ -3733,7 +3746,7 @@ function renderAdminAgenda() {
       ${_viewerMode ? '' : `<button class="btn btn-ghost" style="margin-top:10px;border-color:var(--text3);color:var(--text3);width:auto;padding:6px 14px;font-size:0.8rem" onclick="unblockDay('${dateStr}')">Desbloquear día</button>`}
     </div>`;
   } else {
-    if (!_viewerMode) html += `<div style="margin-top:40px;border-top:1px solid var(--border);padding-top:12px"><button class="btn btn-ghost" style="border-color:var(--red);color:var(--red)" onclick="cancelFullDay('${dateStr}')">🚫 Cancelar todas las citas de hoy</button></div>`;
+    if (!_viewerMode && dateStr >= todayD) html += `<div style="margin-top:40px;border-top:1px solid var(--border);padding-top:12px"><button class="btn btn-ghost" style="border-color:var(--red);color:var(--red)" onclick="cancelFullDay('${dateStr}')">🚫 Cancelar todas las citas de hoy</button></div>`;
   }
   return html;
 }
@@ -3970,6 +3983,68 @@ function confirmUnblockDay(dateStr) {
   if (typeof bookState !== 'undefined' && bookState.date) selectDate(dateStr);
 }
 
+// Individual-hour blocking (as opposed to blockDay/unblockDay which block the whole day).
+// Stored as 'YYYY-MM-DD|HH:MM' strings in APP.db.blockedSlots, mirroring the blockedDays pattern.
+function confirmBlockSlot(dateStr, time) {
+  if (APP._adminSession) { showToast('Modo vista — no puedes realizar esta acción', 'info'); return; }
+  const appt = APP.db.appointments.find(a => a.date === dateStr && a.time === time && ['pending','confirmed'].includes(a.status));
+  const who = appt ? (function(){ const cl = APP.db.clients.find(c => c.id === appt.clientId); return getAdminName(appt.clientId, cl ? cl.phone : '') || appt.clientName; })() : null;
+  const warningHtml = who
+    ? `<div class="card card-red" style="margin:12px 0;padding:10px;text-align:left"><div style="font-size:0.8rem;color:var(--red);line-height:1.5">⚠️ Esta hora tiene una cita de <strong>${escHtml(who)}</strong>. Si bloqueas, la cita se <strong>cancelará</strong> y se avisará al cliente.</div></div>`
+    : '';
+  openModal('🚫 Bloquear hora', `
+    <div style="text-align:center;padding:10px 0 8px">
+      <div style="font-size:2rem;margin-bottom:8px">🚫</div>
+      <div style="font-size:1rem;font-weight:600;color:var(--text)">¿Bloquear las ${time} del ${formatDateHuman(dateStr)}?</div>
+      ${warningHtml}
+    </div>
+    <div style="display:flex;gap:10px;margin-top:8px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-red" style="flex:1" onclick="closeModal();doBlockSlot('${dateStr}','${time}')">Sí, bloquear</button>
+    </div>
+  `);
+}
+
+function doBlockSlot(dateStr, time) {
+  if (!APP.db.blockedSlots) APP.db.blockedSlots = [];
+  const key = dateStr + '|' + time;
+  if (!APP.db.blockedSlots.includes(key)) APP.db.blockedSlots.push(key);
+  const appt = APP.db.appointments.find(a => a.date === dateStr && a.time === time && ['pending','confirmed'].includes(a.status));
+  if (appt) {
+    // Reuses the standard admin-cancel flow: cancels the appt, notifies the client,
+    // cleans up scheduled pushes, saves, and navigates home — same as the normal ✕ button.
+    confirmCancelAppt(appt.id);
+  } else {
+    saveDB();
+    showToast('Hora bloqueada ✓', 'success');
+    if (typeof bookState !== 'undefined' && bookState.date) selectDate(dateStr);
+  }
+}
+
+function confirmUnblockSlot(dateStr, time) {
+  if (APP._adminSession) { showToast('Modo vista — no puedes realizar esta acción', 'info'); return; }
+  openModal('Desbloquear hora', `
+    <div style="text-align:center;padding:10px 0 8px">
+      <div style="font-size:2rem;margin-bottom:8px">✅</div>
+      <div style="font-size:1rem;font-weight:600;color:var(--text)">¿Desbloquear las ${time} del ${formatDateHuman(dateStr)}?</div>
+      <div style="font-size:0.82rem;color:var(--text3);margin-top:6px">Los clientes podrán volver a reservar esta hora.</div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:8px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-gold" style="flex:1" onclick="closeModal();unblockSlot('${dateStr}','${time}')">Sí, desbloquear</button>
+    </div>
+  `);
+}
+
+function unblockSlot(dateStr, time) {
+  if (APP._adminSession) { showToast('Modo vista — no puedes realizar esta acción', 'info'); return; }
+  const key = dateStr + '|' + time;
+  APP.db.blockedSlots = (APP.db.blockedSlots || []).filter(k => k !== key);
+  saveDB();
+  showToast('Hora desbloqueada ✓', 'success');
+  if (typeof bookState !== 'undefined' && bookState.date) selectDate(dateStr);
+}
+
 function startLateTimers() {
   const now = new Date();
   document.querySelectorAll('[id^="lateTimer_"]').forEach(el => {
@@ -4154,7 +4229,12 @@ function renderTimeSlots() {
     setTimeout(renderBookStep, 0); // defer so parent renderBookStep completes first
     return '';
   }
-  const slots = generateSlots(sched.start, sched.end, APP.db.slotDuration || 45);
+  let slots = generateSlots(sched.start, sched.end, APP.db.slotDuration || 45);
+  // Remove individually-blocked hours (admin's per-slot block) — they must not be
+  // offered to clients at all, same as a fully blocked day but at hour granularity.
+  if (APP.db.blockedSlots && APP.db.blockedSlots.length) {
+    slots = slots.filter(s => !APP.db.blockedSlots.includes(bookState.date + '|' + s));
+  }
   const taken = APP.db.appointments
     .filter(a => a.date === bookState.date && ['pending','confirmed'].includes(a.status))
     .map(a => a.time);
@@ -8002,6 +8082,7 @@ function startRealTimeSync() {
             oohRequests: mergeByStatus(remote.oohRequests, APP.db.oohRequests),
             lateChecks: safeMergeArr(remote.lateChecks, APP.db.lateChecks),
             blockedDays: safeMergeArr(remote.blockedDays, APP.db.blockedDays),
+            blockedSlots: safeMergeArr(remote.blockedSlots, APP.db.blockedSlots),
             cancelWaitlist: safeMergeArr(remote.cancelWaitlist, APP.db.cancelWaitlist),
             swapRequests: mergeByStatus(remote.swapRequests, APP.db.swapRequests),
             normas: remote.normas || APP.db.normas,
