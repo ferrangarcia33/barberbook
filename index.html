@@ -3664,11 +3664,15 @@ function renderAdminAgenda() {
       if (_oohPast) {
         const _oohLabel = oohAppt.status === 'late' ? 'Fuera de horario — Llegó tarde ⏰' : oohAppt.status === 'no-show' ? 'Fuera de horario — No se presentó 🚫' : 'Fuera de horario — Realizada ✓';
         const _oohPill = oohAppt.status === 'no-show' ? 'pill-red' : oohAppt.status === 'late' ? 'pill-green' : 'pill-blue';
+        const _oohCorrectionBtn = _viewerMode ? '' : `<button class="btn btn-ghost btn-sm" style="width:auto;padding:2px 10px;font-size:1rem;letter-spacing:2px;border-color:var(--border2);color:var(--text2)" onclick="${oohAppt._archived ? `openArchivedCorrectionMenu('${oohAppt.id}')` : `openCorrectionMenu('${oohAppt.id}')`}">···</button>`;
         html += `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;opacity:0.65">
           <div style="font-family:'Courier New',monospace;font-weight:700;color:var(--text3);font-size:0.9rem;min-width:46px">${slot}</div>
           <div style="flex:1">
             <div style="font-weight:600;font-size:0.9rem;color:var(--text2)">${_oohName}</div>
-            <span class="pill pill-blue" style="margin-top:2px">${_oohLabel}</span>
+            <div style="display:flex;align-items:center;gap:6px;margin-top:2px;flex-wrap:wrap">
+              <span class="pill pill-blue" style="display:inline-flex">${_oohLabel}</span>
+              ${_oohCorrectionBtn}
+            </div>
           </div>
         </div>`;
       } else {
