@@ -2495,6 +2495,7 @@ function renderNormasAckScreen() {
 
 function ackNormas() {
   if (!APP.currentUser || APP.isAdmin) return;
+  if (APP._adminSession) { showToast('Modo vista — no puedes realizar esta acción', 'info'); return; }
   APP.currentUser.normasAckVersion = APP.db.normasVersion || 'acked';
   const client = APP.db.clients.find(c => c.id === APP.currentUser.id);
   if (client) client.normasAckVersion = APP.db.normasVersion || 'acked';
@@ -3667,13 +3668,11 @@ function renderAdminAgenda() {
         const _oohCorrectionBtn = _viewerMode ? '' : `<button class="btn btn-ghost btn-sm" style="width:auto;padding:2px 10px;font-size:1rem;letter-spacing:2px;border-color:var(--border2);color:var(--text2)" onclick="${oohAppt._archived ? `openArchivedCorrectionMenu('${oohAppt.id}')` : `openCorrectionMenu('${oohAppt.id}')`}">···</button>`;
         html += `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;opacity:0.65">
           <div style="font-family:'Courier New',monospace;font-weight:700;color:var(--text3);font-size:0.9rem;min-width:46px">${slot}</div>
-          <div style="flex:1">
+          <div style="flex:1;min-width:0">
             <div style="font-weight:600;font-size:0.9rem;color:var(--text2)">${_oohName}</div>
-            <div style="display:flex;align-items:center;gap:6px;margin-top:2px;flex-wrap:wrap">
-              <span class="pill pill-blue" style="display:inline-flex">${_oohLabel}</span>
-              ${_oohCorrectionBtn}
-            </div>
+            <span class="pill pill-blue" style="margin-top:2px;display:inline-flex">${_oohLabel}</span>
           </div>
+          ${_oohCorrectionBtn}
         </div>`;
       } else {
         html += `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:#0d1220;border:1px solid var(--blue);border-radius:10px">
@@ -4902,7 +4901,7 @@ function apptCard(a, isPast=false) {
       <div class="appt-month" style="font-size:0.6rem;letter-spacing:0.05em">${mon} ${yyyy}</div>
     </div>
     <div class="appt-info">
-      <div class="appt-time">🕐 ${a.time} · ${APP.db.slotDuration || 45}min${a.note && a.note.includes('Fuera de horario') ? ' · <span style="color:var(--blue);font-size:0.7rem;font-weight:700;letter-spacing:0.04em">🕐 OOH</span>' : ''}</div>
+      <div class="appt-time">🕐 ${a.time} · ${APP.db.slotDuration || 45}min${a.note && a.note.includes('Fuera de horario') ? ' · <span style="color:var(--blue);font-size:0.7rem;font-weight:700;letter-spacing:0.04em">🕐 FH</span>' : ''}</div>
       <div class="appt-client">${APP.isAdmin ? (function(){const cl=APP.db.clients.find(c=>c.id===a.clientId);return escHtml(getAdminName(a.clientId,cl?cl.phone:'')||a.clientName);})() : `<span class="pill ${statusMap[a.status]||'pill-gray'}">${statusLabel[a.status]||a.status}</span>`}</div>
       ${APP.isAdmin ? (function() {
         var pillClass = statusMap[a.status] || 'pill-gray';
@@ -5587,7 +5586,7 @@ function renderProfile() {
         finesHtml += `<div class="appt-item">
           <div class="appt-date-block" style="background:var(--red-dim);border:1px solid var(--red)">
             <div class="appt-day" style="color:var(--red);font-size:1.1rem">💸</div>
-            <div class="appt-month" style="color:var(--red)">${c.fineAmount}€</div>
+            <div class="appt-month" style="color:#fff">${c.fineAmount}€</div>
           </div>
           <div class="appt-info">
             <div class="appt-time" style="color:var(--text)">${escHtml(displayName)}</div>
@@ -5633,7 +5632,6 @@ function renderProfile() {
     <div style="margin-top:20px">
       <button class="btn btn-ghost" onclick="logout()">Cerrar sesión</button>
       <button class="btn btn-ghost" style="margin-top:8px;border-color:var(--gold);color:var(--gold)" onclick="registerPush()">🔔 Activar notificaciones push</button>
-      <button class="btn btn-ghost" style="margin-top:8px;border-color:var(--red);color:var(--red)" onclick="confirmClearPushSubs()">🔕 Restablecer notificaciones push de clientes</button>
       <div style="display:flex;gap:8px;margin-top:8px">
         <button class="btn btn-ghost btn-sm" style="flex:1;border-color:var(--blue);color:var(--blue)" onclick="exportData()">📤 Exportar datos</button>
         <button class="btn btn-ghost btn-sm" style="flex:1;border-color:var(--gold);color:var(--gold)" onclick="importDataPrompt()">📥 Importar datos</button>
@@ -8234,7 +8232,7 @@ function check24hReminders() {
     const apptTime = new Date(y, mo-1, d, h, m, 0, 0);
     const hoursLeft = (apptTime - now) / 3600000;
     if (hoursLeft <= 24 && hoursLeft > 0) {
-      addNotif(appt.clientId, `⏰ <strong>Recordatorio:</strong> Tienes cita mañana a las <strong>${appt.time}</strong>. Recuerda que las cancelaciones con menos de 24h tienen un recargo de +5€.`);
+      addNotif(appt.clientId, `⏰ <strong>Recordatorio:</strong><br>Tienes cita mañana a las <strong>${appt.time}</strong>.`);
       // Also fire server-side push in case client has push enabled but app was closed
       // (scheduleReminderPush is idempotent — safe to call even if already scheduled)
       _scheduleReminderPush(appt);
@@ -8615,7 +8613,7 @@ async function _scheduleReminderPush(appt) {
     const fireAt = new Date(_naiveReminder.getTime() - _madridOffsetMs(_naiveReminder) - 24 * 3600 * 1000);
     if (fireAt <= new Date()) return; // already past the 24h window — skip
     const cleanTime = appt.time;
-    const msg = `⏰ Recordatorio: tienes cita mañana a las ${cleanTime}. Cancelaciones con menos de 24h tienen recargo de +5€.`;
+    const msg = `⏰ Recordatorio: tienes cita mañana a las ${cleanTime}.`;
     await sbFetch('/rest/v1/reminders_pending', {
       method: 'POST',
       headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
