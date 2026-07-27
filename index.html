@@ -1398,6 +1398,12 @@ let APP = {
 // =============================================
 let _saveTimer = null;
 let _lastRemoteUpdatedAt = null; // track remote timestamp to avoid stale overwrites
+// FIX: IDs de clientes cuya multa se ha cancelado/marcado como pagada explícitamente
+// en ESTA sesión. Permite que el merge distinga "el admin acaba de quitar la multa"
+// (respetar el false local) de "este dispositivo todavía no había recibido la multa"
+// (no perderla, tomarla de remoto). Antes ambos casos parecían iguales (pendingFine
+// local = false) y el segundo caso borraba multas reales aplicadas en otro dispositivo.
+const _intentionallyClearedFines = new Set();
 let _savePending = false; // true while a save is debounced or in-flight — block sync during this window
 let _saveRetryCount = 0;  // number of consecutive failed Supabase saves
 const _SAVE_MAX_RETRIES = 5; // stop retrying after this many failures
@@ -1514,7 +1520,15 @@ async function _pushDBToSupabase() {
             if (lc.pendingFine && rc.pendingFine && (rc.fineAmount || 0) > (merged2.fineAmount || 0)) {
               merged2.fineAmount = rc.fineAmount;
             }
-            merged2.pendingFine = !!(lc.pendingFine || rc.pendingFine) && lc.pendingFine && ((merged2.fineAmount || 0) > 0);
+            // FIX: si local NO tiene la multa pero remoto sí, y aquí no se ha cancelado/
+            // aprobado explícitamente en esta sesión, es que este dispositivo aún no la
+            // había recibido — se conserva la de remoto en vez de borrarla al guardar.
+            if (!lc.pendingFine && rc.pendingFine && !_intentionallyClearedFines.has(lc.id)) {
+              merged2.pendingFine = true;
+              merged2.fineAmount = rc.fineAmount;
+            } else {
+              merged2.pendingFine = !!(lc.pendingFine || rc.pendingFine) && lc.pendingFine && ((merged2.fineAmount || 0) > 0);
+            }
             // Historial de cortes: unión por apptId (sin duplicados), conservando ambos lados.
             if (Array.isArray(rc.cutHistory)) {
               const localHist = Array.isArray(lc.cutHistory) ? lc.cutHistory : [];
@@ -1728,7 +1742,15 @@ async function loadDB() {
           if (lc.pendingFine && rc.pendingFine && (rc.fineAmount || 0) > (merged2.fineAmount || 0)) {
             merged2.fineAmount = rc.fineAmount;
           }
-          merged2.pendingFine = !!(lc.pendingFine || rc.pendingFine) && lc.pendingFine && ((merged2.fineAmount || 0) > 0);
+          // FIX: si local NO tiene la multa pero remoto sí, y no se ha cancelado/aprobado
+          // explícitamente en esta sesión, este dispositivo aún no la había recibido —
+          // se conserva la de remoto en vez de perderla.
+          if (!lc.pendingFine && rc.pendingFine && !_intentionallyClearedFines.has(lc.id)) {
+            merged2.pendingFine = true;
+            merged2.fineAmount = rc.fineAmount;
+          } else {
+            merged2.pendingFine = !!(lc.pendingFine || rc.pendingFine) && lc.pendingFine && ((merged2.fineAmount || 0) > 0);
+          }
           // Blocked status is admin-controlled and has no client-side state to protect —
           // always trust the remote value so a block/unblock done on another device applies here.
           if (typeof rc.blocked === 'boolean') merged2.blocked = rc.blocked;
@@ -6582,6 +6604,7 @@ function approveFine(clientId) {
 }
 
 function _doApproveFine(clientId) {
+  _intentionallyClearedFines.add(clientId);
   const c = APP.db.clients.find(c => c.id === clientId);
   if (c && c.fineAmount > 0) {
     // Registrar la multa pagada de forma independiente para que se sume a los ingresos del mes
@@ -6641,6 +6664,7 @@ function cancelFine(clientId) {
 }
 
 function _doCancelFine(clientId) {
+  _intentionallyClearedFines.add(clientId);
   const c = APP.db.clients.find(c => c.id === clientId);
   if (!c) return;
   const amount = c.fineAmount || 0;
@@ -8052,7 +8076,15 @@ function startRealTimeSync() {
               if (lc.pendingFine && rc.pendingFine && (rc.fineAmount || 0) > (merged2.fineAmount || 0)) {
                 merged2.fineAmount = rc.fineAmount;
               }
-              merged2.pendingFine = !!(lc.pendingFine || rc.pendingFine) && lc.pendingFine && ((merged2.fineAmount || 0) > 0);
+              // FIX: si local NO tiene la multa pero remoto sí, y no se ha cancelado/aprobado
+              // explícitamente en esta sesión, este dispositivo aún no la había recibido —
+              // se conserva la de remoto en vez de perderla en el siguiente poll.
+              if (!lc.pendingFine && rc.pendingFine && !_intentionallyClearedFines.has(lc.id)) {
+                merged2.pendingFine = true;
+                merged2.fineAmount = rc.fineAmount;
+              } else {
+                merged2.pendingFine = !!(lc.pendingFine || rc.pendingFine) && lc.pendingFine && ((merged2.fineAmount || 0) > 0);
+              }
               // Blocked status is admin-controlled and has no client-side state to protect —
               // always trust the remote value so a block/unblock done on another device applies here.
               if (typeof rc.blocked === 'boolean') merged2.blocked = rc.blocked;
