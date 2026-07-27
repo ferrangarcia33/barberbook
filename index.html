@@ -1489,6 +1489,15 @@ async function _pushDBToSupabase() {
           APP.db.pushSubscriptions = { ...remoteData.pushSubscriptions, ...(APP.db.pushSubscriptions || {}) };
         }
 
+        // FIX: blockedDays no estaba protegido — un dispositivo con una copia local
+        // desactualizada (que aún no había recibido un bloqueo hecho en otro sitio)
+        // podía sobrescribirlo al guardar cualquier otro cambio, desbloqueando el día
+        // sin que nadie lo pidiera. Unión de remoto+local: nunca se pierde un bloqueo.
+        if (Array.isArray(remoteData.blockedDays)) {
+          const localBlocked = APP.db.blockedDays || [];
+          APP.db.blockedDays = [...new Set([...remoteData.blockedDays, ...localBlocked])];
+        }
+
         if (Array.isArray(remoteData.clients)) {
           const localClients = APP.db.clients || [];
           const remoteClientsById = new Map(remoteData.clients.map(c => [c.id, c]));
