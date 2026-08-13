@@ -1404,6 +1404,15 @@ let _lastRemoteUpdatedAt = null; // track remote timestamp to avoid stale overwr
 // (no perderla, tomarla de remoto). Antes ambos casos parecían iguales (pendingFine
 // local = false) y el segundo caso borraba multas reales aplicadas en otro dispositivo.
 const _intentionallyClearedFines = new Set();
+// FIX: IDs de días que el admin acaba de desbloquear explícitamente en ESTA sesión.
+// El merge de blockedDays en _pushDBToSupabase() hace una unión remoto+local para
+// nunca "perder" un bloqueo hecho en otro dispositivo. Pero eso significa que si el
+// admin desbloquea un día localmente, y el snapshot remoto (aún no actualizado)
+// todavía lo tiene bloqueado, la unión lo volvía a añadir — el día nunca se podía
+// desbloquear. Igual que _intentionallyClearedFines, esta lista permite al merge
+// distinguir "el admin acaba de desbloquear esto" de "este dispositivo aún no se
+// enteró del bloqueo", y excluir esos días de la unión.
+const _intentionallyUnblockedDays = new Set();
 let _savePending = false; // true while a save is debounced or in-flight — block sync during this window
 let _saveRetryCount = 0;  // number of consecutive failed Supabase saves
 const _SAVE_MAX_RETRIES = 5; // stop retrying after this many failures
@@ -1501,7 +1510,8 @@ async function _pushDBToSupabase() {
         // sin que nadie lo pidiera. Unión de remoto+local: nunca se pierde un bloqueo.
         if (Array.isArray(remoteData.blockedDays)) {
           const localBlocked = APP.db.blockedDays || [];
-          APP.db.blockedDays = [...new Set([...remoteData.blockedDays, ...localBlocked])];
+          APP.db.blockedDays = [...new Set([...remoteData.blockedDays, ...localBlocked])]
+            .filter(d => !_intentionallyUnblockedDays.has(d));
         }
 
         if (Array.isArray(remoteData.clients)) {
@@ -3868,6 +3878,7 @@ function confirmUnblockAll() {
 function doUnblockAll() {
   const wasIndefinite = !!APP.db.indefiniteClosure;
   const blockedDaysCopy = (APP.db.blockedDays || []).slice();
+  blockedDaysCopy.forEach(d => _intentionallyUnblockedDays.add(d));
   APP.db.blockedDays = [];
   APP.db.indefiniteClosure = false;
   // Remove closure alerts
@@ -3961,6 +3972,7 @@ function doUnblockGroup(group) {
   const _today = todayStr();
   if (group === 'future') {
     const removed = (APP.db.blockedDays || []).filter(d => d >= _today);
+    removed.forEach(d => _intentionallyUnblockedDays.add(d));
     APP.db.blockedDays = (APP.db.blockedDays || []).filter(d => d < _today);
     // Notify clients who had appointments on those days
     const notifiedClients = new Set();
@@ -3977,6 +3989,7 @@ function doUnblockGroup(group) {
     saveDB();
     showToast('Días futuros habilitados ✓', 'success');
   } else {
+    (APP.db.blockedDays || []).filter(d => d < _today).forEach(d => _intentionallyUnblockedDays.add(d));
     APP.db.blockedDays = (APP.db.blockedDays || []).filter(d => d >= _today);
     saveDB();
     showToast('Días pasados eliminados ✓', 'success');
@@ -4001,6 +4014,7 @@ function unblockDayAdmin(dateStr) { _showUnblockModal(dateStr); }
 function unblockDay(dateStr) { _showUnblockModal(dateStr); }
 
 function confirmUnblockDay(dateStr) {
+  _intentionallyUnblockedDays.add(dateStr);
   APP.db.blockedDays = (APP.db.blockedDays || []).filter(d => d !== dateStr);
   // Remove closure alerts and notifications that reference this specific date only
   APP.db.alerts = (APP.db.alerts||[]).filter(a => !(a.type === 'CIERRE' && a.msg && a.msg.includes(dateStr)));
