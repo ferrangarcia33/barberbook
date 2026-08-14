@@ -2417,6 +2417,24 @@ function acceptSwap(reqId) {
   fromAppt.time = toAppt.time;
   toAppt.time = tmp;
   req.status = 'accepted';
+  // FIX: si existía otra solicitud de swap pendiente que involucrara alguna de estas
+  // dos citas (p.ej. el otro cliente había pedido el mismo intercambio en sentido
+  // contrario), queda obsoleta en cuanto este swap se ejecuta, porque las horas que
+  // describía ya no existen. Sin esto, esa notificación seguía mostrando los botones
+  // de Aceptar/Rechazar aunque el cambio ya se hubiera hecho por la otra vía.
+  (APP.db.swapRequests||[]).forEach(r => {
+    if (r.id === req.id || r.status !== 'pending') return;
+    if (r.fromApptId !== fromAppt.id && r.toApptId !== fromAppt.id && r.fromApptId !== toAppt.id && r.toApptId !== toAppt.id) return;
+    r.status = 'rejected';
+    const alreadyNotified = [req.fromClientId, toAppt.clientId];
+    if (!alreadyNotified.includes(r.fromClientId)) {
+      addNotif(r.fromClientId, `❌ Tu solicitud de cambio de hora el ${formatDateHuman(r.date)} ya no es válida porque esa cita cambió de hora.`);
+    }
+    const otherToAppt = APP.db.appointments.find(a => a.id === r.toApptId);
+    if (otherToAppt && !alreadyNotified.includes(otherToAppt.clientId)) {
+      addNotif(otherToAppt.clientId, `❌ El cambio de hora que te propusieron para el ${formatDateHuman(r.date)} ya no es válido porque esa cita cambió de hora.`);
+    }
+  });
   // After swapping times, reset lateChecks for both appointments so the loop
   // re-evaluates based on their new times. This prevents a double push when one
   // appointment moves from a past hour to a future one and vice versa.
