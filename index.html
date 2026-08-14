@@ -1498,6 +1498,31 @@ async function _pushDBToSupabase() {
           APP.db.oohRequests = [...localOOH, ...onlyRemote];
         }
 
+        // FIX: swapRequests no estaba protegido al guardar — solo se protegía al leer/
+        // sincronizar (mergeByStatus en startRealTimeSync). Un dispositivo con una copia
+        // local desactualizada (que aún no había recibido, vía el poll de 5s, que otro
+        // dispositivo aceptó un swap y rechazó automáticamente el conflictivo) podía
+        // sobrescribir en Supabase esos cambios al guardar cualquier otra cosa (incluso
+        // solo abrir notificaciones, que llama a saveDB()). Esto "revivía" una solicitud
+        // ya resuelta como pendiente, mostrando de nuevo los botones Aceptar/Rechazar.
+        // Misma protección por rango de estado que ya usa el polling: pending(0) < accepted/rejected(1).
+        if (Array.isArray(remoteData.swapRequests)) {
+          const localSwap = APP.db.swapRequests || [];
+          const statusRank = { pending: 0, accepted: 1, rejected: 1 };
+          const localSwapById = new Map(localSwap.map(r => [r.id, r]));
+          const merged = remoteData.swapRequests.map(rr => {
+            const loc = localSwapById.get(rr.id);
+            if (!loc) return rr;
+            // Si el remoto tiene un estado más avanzado que el local, prevalece el remoto
+            // (p.ej. otro dispositivo ya aceptó/rechazó y este todavía no se había enterado)
+            if ((statusRank[rr.status] || 0) > (statusRank[loc.status] || 0)) return rr;
+            return loc;
+          });
+          const remoteIds = new Set(remoteData.swapRequests.map(r => r.id));
+          localSwap.forEach(loc => { if (!remoteIds.has(loc.id)) merged.push(loc); });
+          APP.db.swapRequests = merged;
+        }
+
         if (remoteData.pushSubscriptions && typeof remoteData.pushSubscriptions === 'object') {
           // Unión de suscripciones: las que estén en remoto y no en local se conservan
           // (p.ej. una suscripción registrada/renovada en otro dispositivo).
