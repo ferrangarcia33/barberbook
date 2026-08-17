@@ -8515,6 +8515,36 @@ function checkSwapAutoReject() {
   // FIX: guard against running before DB is loaded
   if (!APP.db.adminPin || !Array.isArray(APP.db.swapRequests)) return;
   let changed = false;
+
+  // FIX auto-sanado: repara solicitudes de swap "pendientes" que quedaron obsoletas por una
+  // carrera de sincronización (un dispositivo con datos desactualizados sobrescribió en Supabase
+  // el rechazo automático que acceptSwap() ya había aplicado a la solicitud conflictiva).
+  // Detección precisa: comparamos la hora ACTUAL de cada cita referenciada con la hora que la
+  // solicitud tenía guardada al crearse (req.fromTime/req.toTime). Si no coinciden — o la cita
+  // ya no existe, o ya no está activa (cancelada/completada) — es que cambió por otra vía y la
+  // propuesta ya no es válida. Comparar por hora en vez de "¿esta cita participó alguna vez en
+  // un swap aceptado?" evita falsos positivos: una solicitud nueva y legítima creada después de
+  // que la cita ya se estabilizó en su hora nueva no queda marcada como obsoleta para siempre.
+  APP.db.swapRequests.forEach(req => {
+    if (req.status !== 'pending') return;
+    const fromApptCheck = APP.db.appointments.find(a => a.id === req.fromApptId);
+    const toApptCheck = APP.db.appointments.find(a => a.id === req.toApptId);
+    const fromStale = !fromApptCheck || !['pending','confirmed'].includes(fromApptCheck.status) ||
+      (req.fromTime && fromApptCheck.time !== req.fromTime);
+    const toStale = !toApptCheck || !['pending','confirmed'].includes(toApptCheck.status) ||
+      (req.toTime && toApptCheck.time !== req.toTime);
+    if (!fromStale && !toStale) return;
+    req.status = 'rejected';
+    req.autoRejected = true;
+    const notifiedIds = new Set();
+    addNotif(req.fromClientId, `❌ Tu solicitud de cambio de hora el ${formatDateHuman(req.date)} ya no es válida porque esa cita cambió de hora.`);
+    notifiedIds.add(req.fromClientId);
+    if (toApptCheck && !notifiedIds.has(toApptCheck.clientId)) {
+      addNotif(toApptCheck.clientId, `❌ El cambio de hora que te propusieron para el ${formatDateHuman(req.date)} ya no es válido porque esa cita cambió de hora.`);
+    }
+    changed = true;
+  });
+
   APP.db.swapRequests.forEach(req => {
     if (req.status !== 'pending') return;
     if (getSwapHoursLeft(req) >= 24) return;
