@@ -7954,8 +7954,6 @@ function triggerLateCheck(appt) {
   subEl.textContent = `Han pasado más de 10 minutos de la cita de las ${appt.time}. ¿Está tu cliente presente?`;
   overlay.classList.add('open');
 
-  _sendLateCheckPush(appt);
-
   // Auto-resolve tras 5 min sin respuesta → marcar como realizada
   // (si el admin no responde en 5 min asumimos que el cliente sí llegó)
   setTimeout(() => {
