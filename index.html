@@ -8016,6 +8016,7 @@ function lateCheckAnswer(arrived) {
   if (!lateCheckPending) return;
   const appt = lateCheckPending;
   lateCheckPending = null;
+  _cancelLateCheckPush(appt.id);
   if (!arrived) {
     // "No llegó" → marcar como no-show + multa +5€ (mismo comportamiento que doNoShow)
     const apptObj = APP.db.appointments.find(a => a.id === appt.id);
