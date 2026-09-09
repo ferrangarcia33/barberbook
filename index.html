@@ -3744,7 +3744,13 @@ function renderAdminAgenda() {
   const oohOutOfSlots = dayAppts.filter(a =>
     a.note && a.note.includes('Fuera de horario')
   );
-  const allTimes = [...new Set([...oohOutOfSlots.map(a => a.time), ...slots])].sort();
+  // FIX: a normal (non-OOH) appointment can also fall outside the current slots if the
+  // admin later changes the schedule. Without this, such an appointment silently
+  // disappears from the Agenda view even though it still exists in "Citas".
+  const orphanedApptTimes = dayAppts
+    .filter(a => !(a.note && a.note.includes('Fuera de horario')))
+    .map(a => a.time);
+  const allTimes = [...new Set([...oohOutOfSlots.map(a => a.time), ...slots, ...orphanedApptTimes])].sort();
 
   html += `<div style="display:flex;flex-direction:column;gap:8px">`;
   allTimes.forEach(slot => {
@@ -7195,10 +7201,19 @@ function doSaveSchedule() {
   });
 
   if (orphanedAppts.length > 0) {
+    const orphanedListHtml = orphanedAppts.map(a => {
+      const cl = APP.db.clients.find(c => c.id === a.clientId);
+      const name = escHtml(getAdminName(a.clientId, cl ? cl.phone : '') || a.clientName);
+      return `<div style="display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">
+        <span style="font-weight:600">${name}</span>
+        <span style="color:var(--text3);font-family:'Courier New',monospace;font-size:0.8rem">${formatDateHuman(a.date)} · ${a.time}</span>
+      </div>`;
+    }).join('');
     openModal('⚠️ Citas fuera del nuevo horario', `
       <div style="text-align:center;padding:10px 0 16px">
         <div style="font-size:2rem;margin-bottom:10px">⚠️</div>
         <div style="font-weight:600;font-size:0.95rem;margin-bottom:8px">${orphanedAppts.length} cita${orphanedAppts.length>1?'s':''} quedan fuera del nuevo horario</div>
+        <div style="text-align:left;margin-bottom:8px">${orphanedListHtml}</div>
         <div style="font-size:0.82rem;color:var(--text3);line-height:1.5">Estas citas ya no encajan en los nuevos slots. ¿Guardar igualmente? Tendrás que gestionarlas manualmente en "Citas".</div>
       </div>
       <div style="display:flex;gap:10px">
