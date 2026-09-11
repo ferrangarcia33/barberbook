@@ -3744,13 +3744,7 @@ function renderAdminAgenda() {
   const oohOutOfSlots = dayAppts.filter(a =>
     a.note && a.note.includes('Fuera de horario')
   );
-  // FIX: a normal (non-OOH) appointment can also fall outside the current slots if the
-  // admin later changes the schedule. Without this, such an appointment silently
-  // disappears from the Agenda view even though it still exists in "Citas".
-  const orphanedApptTimes = dayAppts
-    .filter(a => !(a.note && a.note.includes('Fuera de horario')))
-    .map(a => a.time);
-  const allTimes = [...new Set([...oohOutOfSlots.map(a => a.time), ...slots, ...orphanedApptTimes])].sort();
+  const allTimes = [...new Set([...oohOutOfSlots.map(a => a.time), ...slots])].sort();
 
   html += `<div style="display:flex;flex-direction:column;gap:8px">`;
   allTimes.forEach(slot => {
@@ -4468,7 +4462,15 @@ function renderTimeSlots() {
   }
   const canDoAction = hoursToDate >= 24;
 
-  slots.forEach(s => {
+  // FIX: if the client's own appointment time falls outside the current schedule's
+  // generated slots (e.g. admin changed the schedule after booking), it must still be
+  // rendered so the client can see/manage it. Only affects the render loop below —
+  // does not touch `slots` used above for the "ideal slot" scoring logic.
+  const renderSlots = (myApptToday && !slots.includes(myApptToday.time))
+    ? [...slots, myApptToday.time].sort()
+    : slots;
+
+  renderSlots.forEach(s => {
     const isTaken = taken.includes(s);
     const ownerAppt = APP.db.appointments.find(a => a.date === bookState.date && a.time === s && ['pending','confirmed'].includes(a.status));
     const isMySlot = !APP.isAdmin && ownerAppt && ownerAppt.clientId === clientId;
@@ -7201,19 +7203,10 @@ function doSaveSchedule() {
   });
 
   if (orphanedAppts.length > 0) {
-    const orphanedListHtml = orphanedAppts.map(a => {
-      const cl = APP.db.clients.find(c => c.id === a.clientId);
-      const name = escHtml(getAdminName(a.clientId, cl ? cl.phone : '') || a.clientName);
-      return `<div style="display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">
-        <span style="font-weight:600">${name}</span>
-        <span style="color:var(--text3);font-family:'Courier New',monospace;font-size:0.8rem">${formatDateHuman(a.date)} · ${a.time}</span>
-      </div>`;
-    }).join('');
     openModal('⚠️ Citas fuera del nuevo horario', `
       <div style="text-align:center;padding:10px 0 16px">
         <div style="font-size:2rem;margin-bottom:10px">⚠️</div>
         <div style="font-weight:600;font-size:0.95rem;margin-bottom:8px">${orphanedAppts.length} cita${orphanedAppts.length>1?'s':''} quedan fuera del nuevo horario</div>
-        <div style="text-align:left;margin-bottom:8px">${orphanedListHtml}</div>
         <div style="font-size:0.82rem;color:var(--text3);line-height:1.5">Estas citas ya no encajan en los nuevos slots. ¿Guardar igualmente? Tendrás que gestionarlas manualmente en "Citas".</div>
       </div>
       <div style="display:flex;gap:10px">
@@ -8031,7 +8024,6 @@ function lateCheckAnswer(arrived) {
   if (!lateCheckPending) return;
   const appt = lateCheckPending;
   lateCheckPending = null;
-  _cancelLateCheckPush(appt.id);
   if (!arrived) {
     // "No llegó" → marcar como no-show + multa +5€ (mismo comportamiento que doNoShow)
     const apptObj = APP.db.appointments.find(a => a.id === appt.id);
