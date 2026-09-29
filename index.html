@@ -4885,7 +4885,12 @@ function submitOOH() {
 // =============================================
 function renderAppointments() {
   const today = todayStr();
-  let html = `<div class="page-title">${APP.isAdmin ? 'Todas las citas' : 'Mis citas'}</div>`;
+  let html = APP.isAdmin
+    ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px">
+         <div class="page-title" style="margin-bottom:0">Todas las citas</div>
+         <button class="btn btn-gold" style="width:auto;padding:8px 14px;font-size:0.78rem;white-space:nowrap" onclick="openManualAddCutModal()">+ Añadir corte</button>
+       </div>`
+    : `<div class="page-title">Mis citas</div>`;
 
   if (APP.isAdmin) {
     // ADMIN: today + future only, soonest first (ascending — nearest appointment on top)
@@ -5675,6 +5680,147 @@ function confirmDoneAppt(id) {
   addNotif(appt.clientId, `✂️ Tu cita del ${formatDateHuman(appt.date)} a las ${appt.time} ha sido marcada como <strong>realizada</strong>. ¡Gracias y hasta la próxima!`);
   saveDB();
   showToast('Cita marcada como realizada ✓', 'success');
+  navigate('appointments');
+}
+
+// =============================================
+// AÑADIR CORTE MANUAL (admin) — registra un corte ya hecho que no quedó
+// guardado (p.ej. por un fallo puntual), sin pasar por el flujo normal de
+// reserva. No reutiliza ni modifica ninguna función existente.
+// =============================================
+function openManualAddCutModal() {
+  if (!APP.isAdmin) return;
+  const todayD = todayStr();
+  openModal('✂️ Añadir corte', `
+    <div style="text-align:center;padding:6px 0 16px">
+      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:14px">Paso 1 de 3 · Elige la fecha del corte</div>
+      <input type="date" id="manualCutDate" class="input" value="${todayD}" max="${todayD}" style="text-align:center;font-family:'Courier New',monospace">
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-gold" style="flex:1" onclick="(function(){
+        var d = document.getElementById('manualCutDate').value;
+        if (!d) { showToast('Elige una fecha', 'error'); return; }
+        closeModal();
+        manualAddCutStep2(d);
+      })()">Siguiente</button>
+    </div>
+  `);
+}
+
+function manualAddCutStep2(date) {
+  if (!APP.isAdmin) return;
+  openModal('✂️ Añadir corte', `
+    <div style="text-align:center;padding:6px 0 16px">
+      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px">Paso 2 de 3 · Elige la hora</div>
+      <div style="font-size:0.78rem;color:var(--text3);margin-bottom:14px;font-family:'Courier New',monospace">${formatDateHuman(date)}</div>
+      <input type="time" id="manualCutTime" class="input" style="text-align:center;font-family:'Courier New',monospace">
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal();openManualAddCutModal()">Atrás</button>
+      <button class="btn btn-gold" style="flex:1" onclick="(function(){
+        var t = document.getElementById('manualCutTime').value;
+        if (!t) { showToast('Elige una hora', 'error'); return; }
+        closeModal();
+        manualAddCutStep3('${date}', t);
+      })()">Siguiente</button>
+    </div>
+  `);
+}
+
+function manualAddCutStep3(date, time) {
+  if (!APP.isAdmin) return;
+  const clients = APP.db.clients.slice().sort((a,b) => {
+    const na = getAdminName(a.id, a.phone) || a.name;
+    const nb = getAdminName(b.id, b.phone) || b.name;
+    return na.localeCompare(nb, 'es', { sensitivity: 'base' });
+  });
+  if (!clients.length) { showToast('No hay clientes registrados', 'info'); return; }
+  const listHtml = clients.map(c => {
+    const name = getAdminName(c.id, c.phone) || c.name;
+    const initials = name.split(' ').map(n=>n[0]||'').join('').slice(0,2).toUpperCase();
+    return `<div class="manual-cut-client-row" data-name="${escHtml(name.toLowerCase())}" onclick="closeModal();manualAddCutStep4('${date}','${time}','${c.id}')"
+      style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;cursor:pointer;transition:border-color 0.2s"
+      onmouseover="this.style.borderColor='var(--gold)'" onmouseout="this.style.borderColor='var(--border)'">
+      <div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.8rem;flex-shrink:0">${initials}</div>
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:0.9rem">${escHtml(name)}</div>
+        <div style="font-size:0.75rem;color:var(--text3);font-family:'Courier New',monospace">${escHtml(c.phone)}</div>
+      </div>
+    </div>`;
+  }).join('');
+  openModal('✂️ Añadir corte', `
+    <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px;text-align:center">Paso 3 de 3 · Elige el cliente</div>
+    <div style="font-size:0.78rem;color:var(--text3);margin-bottom:12px;text-align:center;font-family:'Courier New',monospace">${formatDateHuman(date)} · ${time}</div>
+    <input type="text" id="manualCutClientSearch" class="input" placeholder="🔍 Buscar por nombre o teléfono..." autocomplete="off" style="margin-bottom:6px"
+      oninput="(function(q){
+        var rows=document.querySelectorAll('#manualCutClientList .manual-cut-client-row');
+        var vis=0;
+        rows.forEach(function(el){ var show=el.dataset.name.includes(q.toLowerCase()); el.style.display=show?'':'none'; if(show)vis++; });
+        var ct=document.getElementById('manualCutClientCount'); if(ct) ct.textContent=vis+' cliente'+(vis!==1?'s':'');
+      })(this.value.toLowerCase())">
+    <div id="manualCutClientCount" style="font-size:0.7rem;color:var(--text3);font-family:'Courier New',monospace;margin-bottom:8px;text-align:right">${clients.length} cliente${clients.length!==1?'s':''}</div>
+    <div id="manualCutClientList" style="max-height:48vh;overflow-y:auto">${listHtml}</div>
+    <div style="margin-top:10px">
+      <button class="btn btn-ghost" style="width:100%" onclick="closeModal();manualAddCutStep2('${date}')">Atrás</button>
+    </div>
+  `);
+  setTimeout(() => { const el = document.getElementById('manualCutClientSearch'); if (el) el.focus(); }, 100);
+}
+
+function manualAddCutStep4(date, time, clientId) {
+  if (!APP.isAdmin) return;
+  const client = APP.db.clients.find(c => c.id === clientId);
+  if (!client) { showToast('Cliente no encontrado', 'error'); return; }
+  const name = getAdminName(client.id, client.phone) || client.name;
+  // Aviso no bloqueante si ya hay algo registrado exactamente a esa fecha+hora
+  const clash = APP.db.appointments.find(a => a.date === date && a.time === time && ['pending','confirmed','done','late'].includes(a.status));
+  const clashWarning = clash ? `<div style="font-size:0.78rem;color:var(--red);margin-top:10px">⚠️ Ya hay otra cita registrada a esa hora (${escHtml(clash.clientName)}). Se añadirá igualmente como registro aparte.</div>` : '';
+  openModal('✂️ Confirmar corte', `
+    <div style="text-align:center;padding:10px 0 16px">
+      <div style="font-size:2.2rem;margin-bottom:10px">✂️</div>
+      <div style="font-size:1rem;font-weight:600;margin-bottom:8px">¿Confirmas añadir este corte?</div>
+      <div style="font-size:0.85rem;color:var(--text2)">${escHtml(name)}</div>
+      <div style="font-size:0.8rem;color:var(--text3);font-family:'Courier New',monospace;margin-top:2px">${formatDateHuman(date)} · ${time}</div>
+      ${clashWarning}
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-gold" style="flex:1" onclick="closeModal();confirmManualAddCut('${date}','${time}','${clientId}')">Sí, añadir</button>
+    </div>
+  `);
+}
+
+function confirmManualAddCut(date, time, clientId) {
+  if (!APP.isAdmin) return;
+  const client = APP.db.clients.find(c => c.id === clientId);
+  if (!client) { showToast('Cliente no encontrado', 'error'); return; }
+  const price = getEffectivePrice(date);
+  const appt = {
+    id: uid(),
+    clientId: client.id,
+    clientName: client.name,
+    date: date,
+    time: time,
+    status: 'done',
+    note: '',
+    bookedPrice: price,
+    amountPaid: price
+  };
+  APP.db.appointments.push(appt);
+  if (!client.cutHistory) client.cutHistory = [];
+  if (!client.cutHistory.find(h => h.apptId === appt.id)) {
+    client.cutHistory.push({
+      apptId: appt.id, date: appt.date, time: appt.time,
+      status: 'done', note: '',
+      amountPaid: appt.amountPaid
+    });
+    client.totalCuts = client.cutHistory.filter(h => h.status !== 'no-show').length;
+  }
+  const name = getAdminName(client.id, client.phone) || client.name;
+  addNotif(client.id, `✂️ Se ha registrado tu corte del ${formatDateHuman(date)} a las ${time}.`);
+  saveDB();
+  showToast(`Corte de ${name} añadido ✓`, 'success');
   navigate('appointments');
 }
 // =============================================
@@ -8039,6 +8185,7 @@ function lateCheckAnswer(arrived) {
   if (!lateCheckPending) return;
   const appt = lateCheckPending;
   lateCheckPending = null;
+  _cancelLateCheckPush(appt.id);
   if (!arrived) {
     // "No llegó" → marcar como no-show + multa +5€ (mismo comportamiento que doNoShow)
     const apptObj = APP.db.appointments.find(a => a.id === appt.id);
