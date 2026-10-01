@@ -5698,45 +5698,77 @@ function confirmDoneAppt(id) {
 // =============================================
 function openManualAddCutModal() {
   if (!APP.isAdmin) return;
+  openModal('✂️ Añadir corte', `
+    <div style="text-align:center;padding:6px 0 16px">
+      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:16px">Paso 1 de 5 · ¿Es una cita pasada o futura?</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <button class="btn btn-ghost" style="width:100%" onclick="closeModal();manualCutStepOOH(true)">✅ Pasada (ya se hizo el corte)</button>
+        <button class="btn btn-ghost" style="width:100%" onclick="closeModal();manualCutStepOOH(false)">📅 Futura (cita pendiente)</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:4px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
+    </div>
+  `);
+}
+
+function manualCutStepOOH(isPast) {
+  if (!APP.isAdmin) return;
+  openModal('✂️ Añadir corte', `
+    <div style="text-align:center;padding:6px 0 16px">
+      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:16px">Paso 2 de 5 · ¿Corte normal o fuera de horario?</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <button class="btn btn-ghost" style="width:100%" onclick="closeModal();manualAddCutStepDate(${isPast},false)">✂️ Corte normal</button>
+        <button class="btn btn-ghost" style="width:100%" onclick="closeModal();manualAddCutStepDate(${isPast},true)">⏰ Fuera de horario (+5€)</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:4px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal();openManualAddCutModal()">Atrás</button>
+    </div>
+  `);
+}
+
+function manualAddCutStepDate(isPast, isOOH) {
+  if (!APP.isAdmin) return;
   const todayD = todayStr();
   openModal('✂️ Añadir corte', `
     <div style="text-align:center;padding:6px 0 16px">
-      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:14px">Paso 1 de 3 · Elige la fecha del corte</div>
-      <input type="date" id="manualCutDate" class="input" value="${todayD}" max="${todayD}" style="text-align:center;font-family:'Courier New',monospace">
+      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:14px">Paso 3 de 5 · Elige la fecha del corte</div>
+      <input type="date" id="manualCutDate" class="input" value="${todayD}" ${isPast ? `max="${todayD}"` : `min="${todayD}"`} style="text-align:center;font-family:'Courier New',monospace">
     </div>
     <div style="display:flex;gap:10px">
-      <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal();manualCutStepOOH(${isPast})">Atrás</button>
       <button class="btn btn-gold" style="flex:1" onclick="(function(){
         var d = document.getElementById('manualCutDate').value;
         if (!d) { showToast('Elige una fecha', 'error'); return; }
         closeModal();
-        manualAddCutStep2(d);
+        manualAddCutStep2(d, ${isPast}, ${isOOH});
       })()">Siguiente</button>
     </div>
   `);
 }
 
-function manualAddCutStep2(date) {
+function manualAddCutStep2(date, isPast, isOOH) {
   if (!APP.isAdmin) return;
   openModal('✂️ Añadir corte', `
     <div style="text-align:center;padding:6px 0 16px">
-      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px">Paso 2 de 3 · Elige la hora</div>
+      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px">Paso 4 de 5 · Elige la hora</div>
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:14px;font-family:'Courier New',monospace">${formatDateHuman(date)}</div>
       <input type="time" id="manualCutTime" class="input" style="text-align:center;font-family:'Courier New',monospace">
     </div>
     <div style="display:flex;gap:10px">
-      <button class="btn btn-ghost" style="flex:1" onclick="closeModal();openManualAddCutModal()">Atrás</button>
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal();manualAddCutStepDate(${isPast},${isOOH})">Atrás</button>
       <button class="btn btn-gold" style="flex:1" onclick="(function(){
         var t = document.getElementById('manualCutTime').value;
         if (!t) { showToast('Elige una hora', 'error'); return; }
         closeModal();
-        manualAddCutStep3('${date}', t);
+        manualAddCutStep3('${date}', t, ${isPast}, ${isOOH});
       })()">Siguiente</button>
     </div>
   `);
 }
 
-function manualAddCutStep3(date, time) {
+function manualAddCutStep3(date, time, isPast, isOOH) {
   if (!APP.isAdmin) return;
   const clients = APP.db.clients.slice().sort((a,b) => {
     const na = getAdminName(a.id, a.phone) || a.name;
@@ -5747,7 +5779,7 @@ function manualAddCutStep3(date, time) {
   const listHtml = clients.map(c => {
     const name = getAdminName(c.id, c.phone) || c.name;
     const initials = name.split(' ').map(n=>n[0]||'').join('').slice(0,2).toUpperCase();
-    return `<div class="manual-cut-client-row" data-name="${escHtml(name.toLowerCase())}" onclick="closeModal();manualAddCutStep4('${date}','${time}','${c.id}')"
+    return `<div class="manual-cut-client-row" data-name="${escHtml(name.toLowerCase())}" onclick="closeModal();manualAddCutStep4('${date}','${time}','${c.id}',${isPast},${isOOH})"
       style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;cursor:pointer;transition:border-color 0.2s"
       onmouseover="this.style.borderColor='var(--gold)'" onmouseout="this.style.borderColor='var(--border)'">
       <div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.8rem;flex-shrink:0">${initials}</div>
@@ -5758,7 +5790,7 @@ function manualAddCutStep3(date, time) {
     </div>`;
   }).join('');
   openModal('✂️ Añadir corte', `
-    <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px;text-align:center">Paso 3 de 3 · Elige el cliente</div>
+    <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px;text-align:center">Paso 5 de 5 · Elige el cliente</div>
     <div style="font-size:0.78rem;color:var(--text3);margin-bottom:12px;text-align:center;font-family:'Courier New',monospace">${formatDateHuman(date)} · ${time}</div>
     <input type="text" id="manualCutClientSearch" class="input" placeholder="🔍 Buscar por nombre o teléfono..." autocomplete="off" style="margin-bottom:6px"
       oninput="(function(q){
@@ -5768,67 +5800,76 @@ function manualAddCutStep3(date, time) {
         var ct=document.getElementById('manualCutClientCount'); if(ct) ct.textContent=vis+' cliente'+(vis!==1?'s':'');
       })(this.value.toLowerCase())">
     <div id="manualCutClientCount" style="font-size:0.7rem;color:var(--text3);font-family:'Courier New',monospace;margin-bottom:8px;text-align:right">${clients.length} cliente${clients.length!==1?'s':''}</div>
-    <div id="manualCutClientList" style="max-height:48vh;overflow-y:auto">${listHtml}</div>
+    <div id="manualCutClientList" style="max-height:44vh;overflow-y:auto">${listHtml}</div>
     <div style="margin-top:10px">
-      <button class="btn btn-ghost" style="width:100%" onclick="closeModal();manualAddCutStep2('${date}')">Atrás</button>
+      <button class="btn btn-ghost" style="width:100%" onclick="closeModal();manualAddCutStep2('${date}',${isPast},${isOOH})">Atrás</button>
     </div>
   `);
   setTimeout(() => { const el = document.getElementById('manualCutClientSearch'); if (el) el.focus(); }, 100);
 }
 
-function manualAddCutStep4(date, time, clientId) {
+function manualAddCutStep4(date, time, clientId, isPast, isOOH) {
   if (!APP.isAdmin) return;
   const client = APP.db.clients.find(c => c.id === clientId);
   if (!client) { showToast('Cliente no encontrado', 'error'); return; }
   const name = getAdminName(client.id, client.phone) || client.name;
+  const price = getEffectivePrice(date) + (isOOH ? 5 : 0);
   // Aviso no bloqueante si ya hay algo registrado exactamente a esa fecha+hora
   const clash = APP.db.appointments.find(a => a.date === date && a.time === time && ['pending','confirmed','done','late'].includes(a.status));
   const clashWarning = clash ? `<div style="font-size:0.78rem;color:var(--red);margin-top:10px">⚠️ Ya hay otra cita registrada a esa hora (${escHtml(clash.clientName)}). Se añadirá igualmente como registro aparte.</div>` : '';
   openModal('✂️ Confirmar corte', `
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2.2rem;margin-bottom:10px">✂️</div>
-      <div style="font-size:1rem;font-weight:600;margin-bottom:8px">¿Confirmas añadir este corte?</div>
+      <div style="font-size:1rem;font-weight:600;margin-bottom:8px">¿Confirmas añadir esta cita?</div>
       <div style="font-size:0.85rem;color:var(--text2)">${escHtml(name)}</div>
       <div style="font-size:0.8rem;color:var(--text3);font-family:'Courier New',monospace;margin-top:2px">${formatDateHuman(date)} · ${time}</div>
+      <div style="font-size:0.78rem;color:var(--text3);margin-top:6px">${isPast ? 'Pasada — se marcará como Realizada' : 'Futura — quedará como Reservada'}${isOOH ? ' · Fuera de horario (' + price + '€)' : ''}</div>
       ${clashWarning}
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
-      <button class="btn btn-gold" style="flex:1" onclick="closeModal();confirmManualAddCut('${date}','${time}','${clientId}')">Sí, añadir</button>
+      <button class="btn btn-gold" style="flex:1" onclick="closeModal();confirmManualAddCut('${date}','${time}','${clientId}',${isPast},${isOOH})">Sí, añadir</button>
     </div>
   `);
 }
 
-function confirmManualAddCut(date, time, clientId) {
+function confirmManualAddCut(date, time, clientId, isPast, isOOH) {
   if (!APP.isAdmin) return;
   const client = APP.db.clients.find(c => c.id === clientId);
   if (!client) { showToast('Cliente no encontrado', 'error'); return; }
-  const price = getEffectivePrice(date);
+  const price = getEffectivePrice(date) + (isOOH ? 5 : 0);
   const appt = {
     id: uid(),
     clientId: client.id,
     clientName: client.name,
     date: date,
     time: time,
-    status: 'done',
-    note: '',
-    bookedPrice: price,
-    amountPaid: price
+    status: isPast ? 'done' : (isOOH ? 'confirmed' : 'pending'),
+    note: isOOH ? ('Fuera de horario +' + price + '€') : '',
+    bookedPrice: price
   };
-  APP.db.appointments.push(appt);
-  if (!client.cutHistory) client.cutHistory = [];
-  if (!client.cutHistory.find(h => h.apptId === appt.id)) {
-    client.cutHistory.push({
-      apptId: appt.id, date: appt.date, time: appt.time,
-      status: 'done', note: '',
-      amountPaid: appt.amountPaid
-    });
-    client.totalCuts = client.cutHistory.filter(h => h.status !== 'no-show').length;
+  if (isPast) {
+    appt.amountPaid = price;
+    APP.db.appointments.push(appt);
+    if (!client.cutHistory) client.cutHistory = [];
+    if (!client.cutHistory.find(h => h.apptId === appt.id)) {
+      client.cutHistory.push({
+        apptId: appt.id, date: appt.date, time: appt.time,
+        status: 'done', note: appt.note,
+        amountPaid: appt.amountPaid
+      });
+      client.totalCuts = client.cutHistory.filter(h => h.status !== 'no-show').length;
+    }
+  } else {
+    APP.db.appointments.push(appt);
   }
   const name = getAdminName(client.id, client.phone) || client.name;
-  addNotif(client.id, `✂️ Se ha registrado tu corte del ${formatDateHuman(date)} a las ${time}.`);
+  const msg = isPast
+    ? `✂️ Se ha registrado tu corte del ${formatDateHuman(date)} a las ${time}.`
+    : `📅 Se te ha añadido una cita el ${formatDateHuman(date)} a las ${time}.`;
+  addNotif(client.id, msg);
   saveDB();
-  showToast(`Corte de ${name} añadido ✓`, 'success');
+  showToast(`${isPast ? 'Corte' : 'Cita'} de ${name} añadido ✓`, 'success');
   navigate('appointments');
 }
 // =============================================
