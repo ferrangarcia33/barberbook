@@ -5733,7 +5733,7 @@ function manualAddCutStepDate(isPast, isOOH) {
   const todayD = todayStr();
   openModal('✂️ Añadir corte', `
     <div style="text-align:center;padding:6px 0 16px">
-      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:14px">Paso 3 de 5 · Elige la fecha del corte</div>
+      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:14px">Paso 3 de 5 · Elige la fecha del corte (${isOOH ? 'Fuera de horario' : 'Corte normal'})</div>
       <input type="date" id="manualCutDate" class="input" value="${todayD}" ${isPast ? `max="${todayD}"` : `min="${todayD}"`} style="text-align:center;font-family:'Courier New',monospace">
     </div>
     <div style="display:flex;gap:10px">
@@ -5752,7 +5752,7 @@ function manualAddCutStep2(date, isPast, isOOH) {
   if (!APP.isAdmin) return;
   openModal('✂️ Añadir corte', `
     <div style="text-align:center;padding:6px 0 16px">
-      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px">Paso 4 de 5 · Elige la hora</div>
+      <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px">Paso 4 de 5 · Elige la hora (${isOOH ? 'Fuera de horario' : 'Corte normal'})</div>
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:14px;font-family:'Courier New',monospace">${formatDateHuman(date)}</div>
       <input type="time" id="manualCutTime" class="input" style="text-align:center;font-family:'Courier New',monospace">
     </div>
@@ -5790,7 +5790,7 @@ function manualAddCutStep3(date, time, isPast, isOOH) {
     </div>`;
   }).join('');
   openModal('✂️ Añadir corte', `
-    <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px;text-align:center">Paso 5 de 5 · Elige el cliente</div>
+    <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px;text-align:center">Paso 5 de 5 · Elige el cliente (${isOOH ? 'Fuera de horario' : 'Corte normal'})</div>
     <div style="font-size:0.78rem;color:var(--text3);margin-bottom:12px;text-align:center;font-family:'Courier New',monospace">${formatDateHuman(date)} · ${time}</div>
     <input type="text" id="manualCutClientSearch" class="input" placeholder="🔍 Buscar por nombre o teléfono..." autocomplete="off" style="margin-bottom:6px"
       oninput="(function(q){
