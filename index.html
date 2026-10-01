@@ -1585,7 +1585,15 @@ async function _pushDBToSupabase() {
           }
         }
       }
-    } catch(e) { /* merge es best-effort — si falla, guardamos igual */ }
+    } catch(e) {
+      // FIX: si la lectura/fusión previa al guardado falla (p.ej. incidencia de Supabase
+      // o corte de red), NO continuar con un guardado sin fusionar — eso es justo lo que
+      // podía sobrescribir citas que este dispositivo aún no tenía cargadas. En su lugar,
+      // abortar aquí y dejar que el mecanismo de reintento (catch exterior, más abajo)
+      // lo reintente en 5s. Los datos locales ya están a salvo en localStorage/IndexedDB
+      // (guardado unas líneas arriba) mientras tanto.
+      throw new Error('No se pudo verificar el estado remoto antes de guardar: ' + (e && e.message));
+    }
 
     // Guardar la DB mergeada
     const res = await sbFetch('/rest/v1/barberbook_db', {
