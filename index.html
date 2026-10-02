@@ -9183,22 +9183,32 @@ function markRead(id) {
 // =============================================
 // MODAL
 // =============================================
+let _modalScrollLockY = 0;
 function openModal(title, body) {
   document.getElementById('modalTitle').textContent = title;
   document.getElementById('modalBody').innerHTML = body;
   document.getElementById('modal').classList.add('open');
-  // FIX: evitar que el fondo se pueda desplazar/mover mientras el modal (y el teclado) están abiertos.
-  // El scroll real de la app lo hace .main-content, no body, así que hay que bloquear ambos.
-  document.body.style.overflow = 'hidden';
+  // FIX: en iOS, overflow:hidden en body NO bloquea de forma fiable el scroll/arrastre de fondo
+  // (bug conocido de Safari). El método que sí funciona es fijar la posición del body.
   const _mc = document.querySelector('.main-content');
+  _modalScrollLockY = _mc ? _mc.scrollTop : (window.scrollY || 0);
+  document.body.style.position = 'fixed';
+  document.body.style.top = '0';
+  document.body.style.left = '0';
+  document.body.style.right = '0';
+  document.body.style.width = '100%';
   if (_mc) _mc.style.overflow = 'hidden';
 }
 function closeModal(e) {
   if (!e || e.target === document.getElementById('modal')) {
     document.getElementById('modal').classList.remove('open');
-    document.body.style.overflow = '';
+    document.body.style.position = '';
+    document.body.style.top = '';
+    document.body.style.left = '';
+    document.body.style.right = '';
+    document.body.style.width = '';
     const _mc = document.querySelector('.main-content');
-    if (_mc) _mc.style.overflow = '';
+    if (_mc) { _mc.style.overflow = ''; _mc.scrollTop = _modalScrollLockY; }
     if (window._cancelTick) { clearInterval(window._cancelTick); window._cancelTick = null; }
   }
 }
