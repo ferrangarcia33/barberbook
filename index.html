@@ -2620,6 +2620,38 @@ function addNorma() {
   renderNormasPanel();
 }
 
+function editNorma(id) {
+  const n = (APP.db.normas||[]).find(x => x.id === id);
+  if (!n) return;
+  openModal('✏️ Editar norma', `
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input type="text" id="editNormaIcon" class="input" value="${escHtml(n.icon)}" style="width:60px;text-align:center;font-size:1.2rem">
+      <input type="text" id="editNormaText" class="input" value="${escHtml(n.text)}" style="flex:1">
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-gold" style="flex:1" onclick="saveEditedNorma('${id}')">Guardar</button>
+    </div>
+  `);
+}
+
+function saveEditedNorma(id) {
+  const n = (APP.db.normas||[]).find(x => x.id === id);
+  if (!n) return;
+  const icon = (() => { const _el = document.getElementById('editNormaIcon'); return _el ? _el.value.trim() : ''; })() || '📌';
+  const text = (() => { const _el = document.getElementById('editNormaText'); return _el ? _el.value.trim() : ''; })();
+  if (!text) { showToast('Escribe el texto de la norma', 'error'); return; }
+  n.icon = icon;
+  n.text = text;
+  // Mark normas as changed — clients will see a one-time confirmation screen
+  APP.db.normasVersion = Date.now();
+  addAlertBroadcast('NORMA', `Se ha actualizado una norma: ${icon} ${text.replace(/<[^>]*>/g,'')}`);
+  saveDB();
+  closeModal();
+  showToast('Norma actualizada ✓', 'success');
+  renderNormasPanel();
+}
+
 function confirmDeleteNorma(id) {
   const n = (APP.db.normas||[]).find(x => x.id === id);
   if (!n) return;
@@ -7519,6 +7551,7 @@ function renderNormasPanel() {
       <div style="display:flex;align-items:center;gap:10px;padding:10px;background:var(--bg3);border-radius:10px;margin-bottom:8px">
         <span style="font-size:1.2rem">${escHtml(n.icon)}</span>
         <div style="flex:1;font-size:0.82rem;color:var(--text2)">${sanitizeNormaText(n.text)}</div>
+        <button class="btn btn-ghost btn-sm" style="width:auto;padding:4px 10px;flex-shrink:0" onclick="editNorma('${n.id}')">✏️</button>
         <button class="btn btn-ghost btn-sm" style="border-color:var(--red);color:var(--red);width:auto;padding:4px 10px;flex-shrink:0" onclick="confirmDeleteNorma('${n.id}')">🗑</button>
       </div>`).join('')}
     <div style="margin-top:14px" class="section-label">Añadir nueva norma</div>
