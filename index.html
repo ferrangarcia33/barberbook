@@ -1937,6 +1937,17 @@ window.addEventListener('beforeunload', () => {
   }
 });
 
+if (window.visualViewport) {
+  const _fixModalViewport = () => {
+    const modal = document.getElementById('modal');
+    if (!modal) return;
+    modal.style.height = window.visualViewport.height + 'px';
+    modal.style.top = window.visualViewport.offsetTop + 'px';
+  };
+  window.visualViewport.addEventListener('resize', _fixModalViewport);
+  window.visualViewport.addEventListener('scroll', _fixModalViewport);
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   // Restore _adminSession from sessionStorage if admin was in view-as-client mode
   try {
