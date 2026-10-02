@@ -2620,14 +2620,28 @@ function addNorma() {
   renderNormasPanel();
 }
 
+function wrapBoldInTextarea(textareaId) {
+  const el = document.getElementById(textareaId);
+  if (!el) return;
+  const start = el.selectionStart, end = el.selectionEnd;
+  if (start === end) { showToast('Selecciona primero el texto que quieres poner en negrita', 'info'); return; }
+  const before = el.value.slice(0, start);
+  const selected = el.value.slice(start, end);
+  const after = el.value.slice(end);
+  el.value = before + '<strong>' + selected + '</strong>' + after;
+  el.focus();
+  el.setSelectionRange(start + 8, start + 8 + selected.length); // 8 = '<strong>'.length
+}
+
 function editNorma(id) {
   const n = (APP.db.normas||[]).find(x => x.id === id);
   if (!n) return;
   openModal('✏️ Editar norma', `
-    <div style="display:flex;gap:8px;margin-bottom:10px">
-      <input type="text" id="editNormaIcon" class="input" value="${escHtml(n.icon)}" style="width:60px;text-align:center;font-size:1.2rem">
-      <input type="text" id="editNormaText" class="input" value="${escHtml(n.text)}" style="flex:1">
-    </div>
+    <input type="text" id="editNormaIcon" class="input" value="${escHtml(n.icon)}" style="width:60px;text-align:center;font-size:1.2rem;margin-bottom:8px"
+      onfocus="this.scrollIntoView({block:'center',behavior:'smooth'})">
+    <textarea id="editNormaText" class="input" rows="3" style="width:100%;resize:vertical;font-family:inherit;margin-bottom:8px"
+      onfocus="this.scrollIntoView({block:'center',behavior:'smooth'})">${escHtml(n.text)}</textarea>
+    <button type="button" class="btn btn-ghost btn-sm" style="width:auto;padding:4px 14px;font-weight:700;margin-bottom:10px" onclick="wrapBoldInTextarea('editNormaText')">B · Negrita</button>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
       <button class="btn btn-gold" style="flex:1" onclick="saveEditedNorma('${id}')">Guardar</button>
