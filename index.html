@@ -3420,8 +3420,6 @@ function renderCalendar() {
     if (APP.isAdmin || APP.isViewer) {
       // Admin/Viewer: can view from today onwards, all appointments visible
       const adminMinDate = new Date(now); adminMinDate.setHours(0,0,0,0);
-      const isMin = date >= adminMinDate;
-      const isMax = date <= maxDate;
       const isAdminBlockedDay = APP.db.blockedDays && APP.db.blockedDays.includes(dateStr);
       // Count all appointment statuses for dot — only for today and future (no dot on past days)
       const isFutureOrToday = dateStr >= todayStr();
@@ -3432,7 +3430,12 @@ function renderCalendar() {
       if (isToday) cls += ' today';
       // A day is clickable if: in range AND (is workday OR has appointments on it)
       const hasAnyAppt = APP.db.appointments.some(a => a.date === dateStr && ['pending','confirmed','done','late','no-show'].includes(a.status));
-      const isClickable = isMin && isMax && (isWorkday || hasAnyAppt);
+      // FIX: un día pasado con cortes ya archivados en el historial del cliente también debe
+      // poder consultarse (antes solo se podía ver si seguía en la lista activa de citas).
+      const hasAnyArchivedEver = APP.db.clients.some(c => (c.cutHistory||[]).some(h => h.date === dateStr));
+      const isMin = (date >= adminMinDate) || hasAnyAppt || hasAnyArchivedEver;
+      const isMax = date <= maxDate;
+      const isClickable = isMin && isMax && (isWorkday || hasAnyAppt || hasAnyArchivedEver);
       if (!isClickable) cls += ' disabled';
       else cls += ' available';
       if (bookState.date === dateStr) cls += ' selected';
@@ -5754,7 +5757,7 @@ function manualAddCutStep2(date, isPast, isOOH) {
     <div style="text-align:center;padding:6px 0 16px">
       <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px">Paso 4 de 5 · Elige la hora (${isOOH ? 'Fuera de horario' : 'Corte normal'})</div>
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:14px;font-family:'Courier New',monospace">${formatDateHuman(date)}</div>
-      <input type="time" id="manualCutTime" class="input" style="text-align:center;font-family:'Courier New',monospace">
+      <input type="time" id="manualCutTime" class="input" value="12:00" style="text-align:center;font-family:'Courier New',monospace">
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal();manualAddCutStepDate(${isPast},${isOOH})">Atrás</button>
