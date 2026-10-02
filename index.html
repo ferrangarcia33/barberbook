@@ -9187,10 +9187,13 @@ function openModal(title, body) {
   document.getElementById('modalTitle').textContent = title;
   document.getElementById('modalBody').innerHTML = body;
   document.getElementById('modal').classList.add('open');
+  // FIX: evitar que el fondo se pueda desplazar/mover mientras el modal (y el teclado) están abiertos
+  document.body.style.overflow = 'hidden';
 }
 function closeModal(e) {
   if (!e || e.target === document.getElementById('modal')) {
     document.getElementById('modal').classList.remove('open');
+    document.body.style.overflow = '';
     if (window._cancelTick) { clearInterval(window._cancelTick); window._cancelTick = null; }
   }
 }
