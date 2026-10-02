@@ -9183,6 +9183,16 @@ function markRead(id) {
 // =============================================
 // MODAL
 // =============================================
+// FIX definitivo: bloquea cualquier arrastre táctil fuera del modal mientras está abierto,
+// sea cual sea el elemento que normalmente haría scroll. Deja pasar el arrastre dentro
+// del propio modal (p.ej. listas internas con su propio scroll) para no romper nada ahí.
+document.addEventListener('touchmove', function(e) {
+  const modal = document.getElementById('modal');
+  if (modal && modal.classList.contains('open') && !e.target.closest('.modal-sheet')) {
+    e.preventDefault();
+  }
+}, { passive: false });
+
 let _modalScrollLockY = 0;
 function openModal(title, body) {
   document.getElementById('modalTitle').textContent = title;
@@ -9197,7 +9207,7 @@ function openModal(title, body) {
   document.body.style.left = '0';
   document.body.style.right = '0';
   document.body.style.width = '100%';
-  if (_mc) _mc.style.overflow = 'hidden';
+  if (_mc) { _mc.style.overflow = 'hidden'; _mc.style.touchAction = 'none'; }
 }
 function closeModal(e) {
   if (!e || e.target === document.getElementById('modal')) {
@@ -9208,7 +9218,7 @@ function closeModal(e) {
     document.body.style.right = '';
     document.body.style.width = '';
     const _mc = document.querySelector('.main-content');
-    if (_mc) { _mc.style.overflow = ''; _mc.scrollTop = _modalScrollLockY; }
+    if (_mc) { _mc.style.overflow = ''; _mc.style.touchAction = ''; _mc.scrollTop = _modalScrollLockY; }
     if (window._cancelTick) { clearInterval(window._cancelTick); window._cancelTick = null; }
   }
 }
