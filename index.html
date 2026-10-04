@@ -1450,10 +1450,12 @@ async function _pushDBToSupabase() {
     // FIX bug5: antes de guardar, leer el estado actual de Supabase y mergear los appointments.
     // Así si dos clientes guardan a la vez, ninguno machaca la cita del otro.
     // Solo mergeamos appointments (el array más crítico) — el resto lo gana el local.
+    let _expectedRemoteTs = null;
     try {
-      const remote = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data', {
+      const remote = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
         headers: { 'Accept': 'application/json' }
       });
+      if (remote && remote.length > 0) _expectedRemoteTs = remote[0].updated_at;
       if (remote && remote.length > 0 && remote[0].data && remote[0].data.appointments) {
         const remoteAppts = remote[0].data.appointments;
         const localAppts = APP.db.appointments;
@@ -1595,17 +1597,37 @@ async function _pushDBToSupabase() {
       throw new Error('No se pudo verificar el estado remoto antes de guardar: ' + (e && e.message));
     }
 
-    // Guardar la DB mergeada
-    const res = await sbFetch('/rest/v1/barberbook_db', {
-      method: 'POST',
-      headers: {
-        'Prefer': 'resolution=merge-duplicates,return=representation',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ id: 'main', data: APP.db, updated_at: now })
-    });
-    // res is null on network error, {} on 204, or the row array on success
-    if (res === null) throw new Error('Supabase upsert returned null');
+    // Guardar la DB mergeada — escritura condicional (compare-and-swap) cuando sabemos
+    // el updated_at que leímos para fusionar: si otro dispositivo ha escrito justo
+    // entre medias, el filtro no encuentra la fila y la escritura no se aplica —
+    // en vez de sobrescribirla a ciegas, lo tratamos como fallo y reintentamos
+    // (el reintento vuelve a leer+fusionar con lo más reciente).
+    let res;
+    if (_expectedRemoteTs) {
+      res = await sbFetch('/rest/v1/barberbook_db?id=eq.main&updated_at=eq.' + encodeURIComponent(_expectedRemoteTs), {
+        method: 'PATCH',
+        headers: {
+          'Prefer': 'return=representation',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ data: APP.db, updated_at: now })
+      });
+      if (res === null) throw new Error('Supabase update returned null');
+      if (Array.isArray(res) && res.length === 0) {
+        throw new Error('Escritura concurrente detectada (otro dispositivo guardó primero) — reintentando');
+      }
+    } else {
+      // No se pudo leer un updated_at previo (p.ej. primera vez) — upsert normal.
+      res = await sbFetch('/rest/v1/barberbook_db', {
+        method: 'POST',
+        headers: {
+          'Prefer': 'resolution=merge-duplicates,return=representation',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ id: 'main', data: APP.db, updated_at: now })
+      });
+      if (res === null) throw new Error('Supabase upsert returned null');
+    }
     // Use the server-returned updated_at so the sync loop comparison is accurate.
     // If Supabase returns the row, grab its updated_at; otherwise fall back to local now.
     const savedTs = (Array.isArray(res) && res[0] && res[0].updated_at) ? res[0].updated_at : now;
@@ -1616,19 +1638,17 @@ async function _pushDBToSupabase() {
   } catch(e) {
     console.error('saveDB error:', e);
     _saveRetryCount++;
-    if (_saveRetryCount >= _SAVE_MAX_RETRIES) {
-      // Stop retrying — data is safe in localStorage/IndexedDB, warn the user
-      _savePending = false;
-      if (dot) dot.style.background = 'var(--red)';
-      showToast('⚠️ Sin conexión con el servidor. Los datos están guardados localmente.', 'error');
-      return;
+    // FIX: nunca rendirse. Antes, tras 5 intentos (25s), se dejaba de reintentar y el
+    // cambio se quedaba sin sincronizar hasta el próximo guardado — lo cual podía dar
+    // la sensación de que "se había perdido" en otros dispositivos. Ahora se sigue
+    // reintentando siempre, con una espera que crece hasta un máximo de 30s, mientras
+    // _savePending sigue en true (así el poll de sincronización nunca pisa este cambio
+    // pendiente con una instantánea remota desactualizada).
+    if (_saveRetryCount === _SAVE_MAX_RETRIES && dot) {
+      showToast('⚠️ Sin conexión con el servidor. Reintentando — tus datos están a salvo localmente.', 'error');
     }
-    // Schedule a retry in 5s to flush the failed push.
-    // Keep _savePending = true until the retry runs so the sync poll doesn't
-    // overwrite local changes with a potentially stale remote snapshot.
-    // Store the timer handle in _retryTimer so saveDB() can cancel it if the user
-    // triggers a new save before the retry fires, preventing two concurrent pushes.
-    _retryTimer = setTimeout(() => { _retryTimer = null; _pushDBToSupabase(); }, 5000);
+    const _delay = Math.min(5000 * Math.min(_saveRetryCount, 6), 30000);
+    _retryTimer = setTimeout(() => { _retryTimer = null; _pushDBToSupabase(); }, _delay);
     if (dot) dot.style.background = 'orange';
   }
 }
