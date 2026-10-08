@@ -9750,18 +9750,20 @@ function generateSlots(start, end, durationMin=45) {
 <script>
 // =============================================
 // AVISO DE SIN CONEXIÓN
-// Bloquea la app mientras no haya conexión con el servidor y la
-// desbloquea sola en cuanto vuelve. No toca ninguna otra lógica:
-// solo observa las peticiones a Supabase y los eventos online/offline.
+// Bloquea la app SOLO cuando no hay internet de verdad y la desbloquea
+// sola en cuanto vuelve. Si fallan las peticiones al servidor pero hay
+// internet (servidor lento o caído), NO bloquea nada.
+// No toca ninguna otra lógica: solo observa las peticiones a Supabase
+// y los eventos online/offline.
 // =============================================
 (function () {
   'use strict';
   var ov = document.getElementById('offline-overlay');
   if (!ov || !window.fetch) return;
 
-  var FAIL_LIMIT = 2;      // fallos de red seguidos para dar la conexión por perdida
+  var FAIL_LIMIT = 2;      // fallos seguidos al servidor antes de comprobar si hay internet
   var PROBE_EVERY = 3000;  // ms entre comprobaciones mientras el aviso está visible
-  var shown = false, fails = 0, probeTimer = null, offlineTimer = null, locked = [];
+  var shown = false, checking = false, fails = 0, probeTimer = null, offlineTimer = null, locked = [];
   var origFetch = window.fetch.bind(window);
 
   function appRunning() {
@@ -9777,6 +9779,18 @@ function generateSlots(start, end, durationMin=45) {
   function unlock() {
     locked.forEach(function (el) { el.removeAttribute('inert'); });
     locked = [];
+  }
+  // ¿Hay internet? Pide un archivo pequeño de la propia web de la app (no del servidor
+  // de datos). Cualquier respuesta, aunque sea un error HTTP, significa que hay internet.
+  function checkInternet(cb) {
+    var c = new AbortController();
+    var t = setTimeout(function () { c.abort(); }, 6000);
+    var url;
+    try { url = new URL('manifest.json', location.href).href + '?c=' + Date.now(); }
+    catch (e) { cb(navigator.onLine !== false); return; }
+    origFetch(url, { method: 'GET', cache: 'no-store', signal: c.signal })
+      .then(function () { clearTimeout(t); cb(true); })
+      .catch(function () { clearTimeout(t); cb(false); });
   }
   function scheduleProbe(ms) {
     clearTimeout(probeTimer);
@@ -9800,32 +9814,32 @@ function generateSlots(start, end, durationMin=45) {
     ov.setAttribute('aria-hidden', 'true');
     unlock();
   }
-  function isGatewayError(status) {
-    return (status >= 502 && status <= 504) || (status >= 522 && status <= 524);
-  }
-  function netOk() { hide(); }
-  function netFail() {
-    if (document.hidden) return;   // en segundo plano el móvil corta la red: no cuenta
-    fails++;
-    if (fails >= FAIL_LIMIT) show();
-  }
-  // Comprobación ligera mientras el aviso está visible
+  // Mientras el aviso está visible: comprueba cada pocos segundos si ya hay internet
   function probe() {
     probeTimer = null;
     if (!shown) return;
-    var c = new AbortController();
-    var t = setTimeout(function () { c.abort(); }, 6000);
-    origFetch(SUPABASE_URL + '/rest/v1/barberbook_db?id=eq.main&select=id', {
-      method: 'GET', cache: 'no-store', signal: c.signal,
-      headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }
-    }).then(function (res) {
-      clearTimeout(t);
-      if (isGatewayError(res.status)) throw new Error('gateway');
-      hide();
-    }).catch(function () {
-      clearTimeout(t);
-      scheduleProbe(PROBE_EVERY);
+    checkInternet(function (up) {
+      if (up) hide(); else scheduleProbe(PROBE_EVERY);
     });
+  }
+  // Tras varios fallos al servidor: ¿es que no hay internet, o solo falla el servidor?
+  function verify() {
+    if (checking || shown) return;
+    checking = true;
+    checkInternet(function (up) {
+      checking = false;
+      if (up) { fails = 0; return; }   // hay internet: el problema es del servidor, no se bloquea
+      show();
+    });
+  }
+  function isGatewayError(status) {
+    return (status >= 502 && status <= 504) || (status >= 522 && status <= 524);
+  }
+  function netOk() { hide(); }          // si el servidor responde, hay internet
+  function netFail() {
+    if (document.hidden) return;        // en segundo plano el móvil corta la red: no cuenta
+    fails++;
+    if (fails >= FAIL_LIMIT) verify();
   }
 
   // Observa las peticiones a Supabase (no las modifica)
@@ -9844,7 +9858,9 @@ function generateSlots(start, end, durationMin=45) {
 
   window.addEventListener('offline', function () {
     clearTimeout(offlineTimer);
-    offlineTimer = setTimeout(function () { if (navigator.onLine === false) show(); }, 1200);
+    offlineTimer = setTimeout(function () {
+      if (navigator.onLine === false) verify();
+    }, 1200);
   });
   window.addEventListener('online', function () {
     clearTimeout(offlineTimer);
