@@ -32,7 +32,7 @@ self.addEventListener('notificationclick', e => {
     e.waitUntil(
       Promise.all([
         // Fast path: tell any open app window to update immediately.
-        clients.matchAll({ type: 'window' }).then(list => {
+        clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
           list.forEach(c => c.postMessage({ type: 'LATE_CHECK_ANSWER', apptId: apptId, answer: e.action }));
         }),
         // Durable path: persist the answer server-side so a closed app picks it

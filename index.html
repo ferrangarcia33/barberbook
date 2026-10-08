@@ -1114,7 +1114,7 @@ window.addEventListener('beforeinstallprompt', e => {
 <body>
 
 <!-- TOAST CONTAINER -->
-<div class="toast-container" id="toastContainer"></div>
+<div class="toast-container" id="toastContainer" role="status" aria-live="polite"></div>
 
 <!-- LATE CHECK OVERLAY -->
 <div class="late-check-overlay" id="lateCheckOverlay">
@@ -1186,14 +1186,14 @@ window.addEventListener('beforeinstallprompt', e => {
       <label class="input-label" for="setupPin">PIN de acceso Barbero (mínimo 6 dígitos)</label>
       <div class="pin-wrapper">
       <input class="input" id="setupPin" type="password" maxlength="20" placeholder="••••••" inputmode="numeric">
-      <button type="button" class="pin-eye" onclick="togglePin('setupPin')" id="eye_setupPin">👁️</button>
+      <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('setupPin')" id="eye_setupPin">👁️</button>
     </div>
     </div>
     <div class="input-group">
       <label class="input-label" for="setupPin2">Confirmar PIN</label>
       <div class="pin-wrapper">
       <input class="input" id="setupPin2" type="password" maxlength="20" placeholder="••••••" inputmode="numeric">
-      <button type="button" class="pin-eye" onclick="togglePin('setupPin2')" id="eye_setupPin2">👁️</button>
+      <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('setupPin2')" id="eye_setupPin2">👁️</button>
     </div>
     </div>
     <div class="input-group">
@@ -1231,7 +1231,7 @@ window.addEventListener('beforeinstallprompt', e => {
         <label class="input-label" for="loginPin">PIN (mínimo 6 dígitos)</label>
         <div class="pin-wrapper">
       <input class="input" id="loginPin" type="password" maxlength="20" placeholder="••••••" inputmode="numeric">
-      <button type="button" class="pin-eye" onclick="togglePin('loginPin')" id="eye_loginPin">👁️</button>
+      <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('loginPin')" id="eye_loginPin">👁️</button>
     </div>
       </div>
       <div class="login-error" id="loginError"></div>
@@ -1244,14 +1244,14 @@ window.addEventListener('beforeinstallprompt', e => {
         <label class="input-label" for="adminPin">PIN Barbero</label>
         <div class="pin-wrapper">
       <input class="input" id="adminPin" type="password" maxlength="20" placeholder="••••••" inputmode="numeric">
-      <button type="button" class="pin-eye" onclick="togglePin('adminPin')" id="eye_adminPin">👁️</button>
+      <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('adminPin')" id="eye_adminPin">👁️</button>
     </div>
       </div>
       <div class="input-group">
         <label class="input-label" for="adminSecret">PIN Secreto</label>
         <div class="pin-wrapper">
       <input class="input" id="adminSecret" type="password" maxlength="30" placeholder="••••••••" inputmode="text">
-      <button type="button" class="pin-eye" onclick="togglePin('adminSecret')" id="eye_adminSecret">👁️</button>
+      <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('adminSecret')" id="eye_adminSecret">👁️</button>
     </div>
       </div>
       <div class="login-error" id="adminError"></div>
@@ -1278,7 +1278,7 @@ window.addEventListener('beforeinstallprompt', e => {
       <label class="input-label" for="regPin">PIN (mínimo 6 dígitos)</label>
       <div class="pin-wrapper">
       <input class="input" id="regPin" type="password" maxlength="20" placeholder="••••••" inputmode="numeric">
-      <button type="button" class="pin-eye" onclick="togglePin('regPin')" id="eye_regPin">👁️</button>
+      <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('regPin')" id="eye_regPin">👁️</button>
     </div>
     </div>
     <div class="login-error" id="regError"></div>
@@ -1538,10 +1538,40 @@ const _intentionallyClearedFines = new Set();
 // distinguir "el admin acaba de desbloquear esto" de "este dispositivo aún no se
 // enteró del bloqueo", y excluir esos días de la unión.
 const _intentionallyUnblockedDays = new Set();
+// FIX: claves (userId) de suscripciones push borradas a propósito en ESTA sesión
+// (doClearPushSubs o 410 Gone). Sin esto, la unión remoto+local de pushSubscriptions
+// en _pushDBToSupabase() las volvía a añadir desde el snapshot remoto y el borrado nunca
+// llegaba a persistirse. Se vacía tras una escritura correcta que ya no las contiene.
+const _intentionallyRemovedPushSubs = new Set();
 let _savePending = false; // true while a save is debounced or in-flight — block sync during this window
 let _saveRetryCount = 0;  // number of consecutive failed Supabase saves
 const _SAVE_MAX_RETRIES = 5; // stop retrying after this many failures
 let _retryTimer = null; // handle for the pending retry setTimeout
+// FIX: contador de generación de guardados. Cada saveDB() lo incrementa; un push solo
+// puede poner _savePending=false si no hubo ningún saveDB() posterior a su inicio.
+// Antes, un push antiguo que terminaba mientras había otro guardado debounced/en vuelo
+// ponía _savePending=false y el poll de 5s podía pisar ese cambio aún no subido.
+let _saveGen = 0;
+// FIX: ids por colección del último estado sincronizado con Supabase (cargado, aplicado
+// desde el poll o escrito con éxito). Permite al merge de _pushDBToSupabase() distinguir
+// "el elemento lo borré yo localmente" (estaba en la base y ya no está en local → no
+// re-añadir) de "el elemento lo creó otro dispositivo" (no estaba en la base → añadir).
+// Sin esto, la unión remoto+local resucitaba cualquier borrado (clientes eliminados,
+// citas archivadas, notificaciones/solicitudes eliminadas). null = sin base fiable → unión.
+let _lastSyncedIds = null;
+function _snapshotSyncedIds(db) {
+  const ids = arr => new Set((Array.isArray(arr) ? arr : []).map(x => x && x.id));
+  return {
+    appointments: ids(db.appointments),
+    notifications: ids(db.notifications),
+    oohRequests: ids(db.oohRequests),
+    swapRequests: ids(db.swapRequests),
+    clients: ids(db.clients)
+  };
+}
+function _wasSyncedAndRemoved(kind, id) {
+  return !!(_lastSyncedIds && _lastSyncedIds[kind] && _lastSyncedIds[kind].has(id));
+}
 
 function saveDB() {
   // Show syncing indicator
@@ -1553,15 +1583,17 @@ function saveDB() {
   if (_retryTimer) { clearTimeout(_retryTimer); _retryTimer = null; }
   // Debounce: wait 800ms after last call to batch writes
   _savePending = true;
+  _saveGen++;
   _saveRetryCount = 0; // new save attempt resets retry counter
   if (_saveTimer) clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(() => { _pushDBToSupabase(); }, 800);
+  _saveTimer = setTimeout(() => { _saveTimer = null; _pushDBToSupabase(); }, 800);
   // Always write to IndexedDB immediately (more persistent than localStorage on Safari ITP)
   _idbSet('barberbook_db_backup', JSON.stringify(APP.db)).catch(() => {});
 }
 
 async function _pushDBToSupabase() {
   const dot = document.getElementById('syncDot');
+  const _genAtStart = _saveGen;
   try {
     const now = new Date().toISOString();
     // Backup local siempre
@@ -1580,6 +1612,9 @@ async function _pushDBToSupabase() {
       const remote = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
         headers: { 'Accept': 'application/json' }
       });
+      // sbFetch() no lanza: devuelve null ante error HTTP, timeout o fallo de red.
+      // Sin esta comprobación, una lectura fallida seguía hacia el upsert sin fusionar.
+      if (remote === null) throw new Error('Lectura remota fallida');
       if (remote && remote.length > 0) _expectedRemoteTs = remote[0].updated_at;
       if (remote && remote.length > 0 && remote[0].data && remote[0].data.appointments) {
         const remoteAppts = remote[0].data.appointments;
@@ -1590,7 +1625,8 @@ async function _pushDBToSupabase() {
           const localIdx = merged.findIndex(la => la.id === ra.id);
           if (localIdx === -1) {
             // Cita nueva en remoto (creada por otro usuario) → añadir
-            merged.push(ra);
+            // FIX: salvo que ya estuviera sincronizada y se haya eliminado localmente
+            if (!_wasSyncedAndRemoved('appointments', ra.id)) merged.push(ra);
           } else {
             // Cita existente: si remoto la tiene cerrada y local activa, el remoto gana
             // (evita resucitar citas canceladas/completadas en otro dispositivo)
@@ -1614,14 +1650,14 @@ async function _pushDBToSupabase() {
         if (Array.isArray(remoteData.notifications)) {
           const localNotifs = APP.db.notifications || [];
           const localIds = new Set(localNotifs.map(n => n.id));
-          const onlyRemote = remoteData.notifications.filter(n => !localIds.has(n.id));
+          const onlyRemote = remoteData.notifications.filter(n => !localIds.has(n.id) && !_wasSyncedAndRemoved('notifications', n.id));
           APP.db.notifications = [...localNotifs, ...onlyRemote];
         }
 
         if (Array.isArray(remoteData.oohRequests)) {
           const localOOH = APP.db.oohRequests || [];
           const localIds = new Set(localOOH.map(r => r.id));
-          const onlyRemote = remoteData.oohRequests.filter(r => !localIds.has(r.id));
+          const onlyRemote = remoteData.oohRequests.filter(r => !localIds.has(r.id) && !_wasSyncedAndRemoved('oohRequests', r.id));
           APP.db.oohRequests = [...localOOH, ...onlyRemote];
         }
 
@@ -1637,7 +1673,9 @@ async function _pushDBToSupabase() {
           const localSwap = APP.db.swapRequests || [];
           const statusRank = { pending: 0, accepted: 1, rejected: 1 };
           const localSwapById = new Map(localSwap.map(r => [r.id, r]));
-          const merged = remoteData.swapRequests.map(rr => {
+          const merged = remoteData.swapRequests
+            .filter(rr => localSwapById.has(rr.id) || !_wasSyncedAndRemoved('swapRequests', rr.id))
+            .map(rr => {
             const loc = localSwapById.get(rr.id);
             if (!loc) return rr;
             // Si el remoto tiene un estado más avanzado que el local, prevalece el remoto
@@ -1653,7 +1691,9 @@ async function _pushDBToSupabase() {
         if (remoteData.pushSubscriptions && typeof remoteData.pushSubscriptions === 'object') {
           // Unión de suscripciones: las que estén en remoto y no en local se conservan
           // (p.ej. una suscripción registrada/renovada en otro dispositivo).
-          APP.db.pushSubscriptions = { ...remoteData.pushSubscriptions, ...(APP.db.pushSubscriptions || {}) };
+          const _localSubs = APP.db.pushSubscriptions || {};
+          APP.db.pushSubscriptions = { ...remoteData.pushSubscriptions, ..._localSubs };
+          _intentionallyRemovedPushSubs.forEach(k => { if (!_localSubs[k]) delete APP.db.pushSubscriptions[k]; });
         }
 
         // FIX: blockedDays no estaba protegido — un dispositivo con una copia local
@@ -1706,7 +1746,7 @@ async function _pushDBToSupabase() {
           });
           // Clientes nuevos creados en otro dispositivo que aún no están en local
           const localClientIds = new Set(localClients.map(c => c.id));
-          const onlyRemoteClients = remoteData.clients.filter(c => !localClientIds.has(c.id));
+          const onlyRemoteClients = remoteData.clients.filter(c => !localClientIds.has(c.id) && !_wasSyncedAndRemoved('clients', c.id));
           if (onlyRemoteClients.length) {
             APP.db.clients = [...APP.db.clients, ...onlyRemoteClients];
           }
@@ -1728,6 +1768,13 @@ async function _pushDBToSupabase() {
     // en vez de sobrescribirla a ciegas, lo tratamos como fallo y reintentamos
     // (el reintento vuelve a leer+fusionar con lo más reciente).
     let res;
+    const _removedSubsWritten = new Set(_intentionallyRemovedPushSubs);
+    // FIX: igual que _removedSubsWritten — estas marcas solo deben proteger el borrado
+    // hasta que quede escrito en Supabase; si no, bloquean para siempre multas/bloqueos
+    // nuevos (de otro dispositivo o re-hechos aquí) sobre el mismo cliente/día.
+    const _clearedFinesWritten = new Set(_intentionallyClearedFines);
+    const _unblockedDaysWritten = new Set(_intentionallyUnblockedDays);
+    const _writtenIds = _snapshotSyncedIds(APP.db);
     if (_expectedRemoteTs) {
       res = await sbFetch('/rest/v1/barberbook_db?id=eq.main&updated_at=eq.' + encodeURIComponent(_expectedRemoteTs), {
         method: 'PATCH',
@@ -1757,7 +1804,11 @@ async function _pushDBToSupabase() {
     // If Supabase returns the row, grab its updated_at; otherwise fall back to local now.
     const savedTs = (Array.isArray(res) && res[0] && res[0].updated_at) ? res[0].updated_at : now;
     _lastRemoteUpdatedAt = savedTs;
-    _savePending = false;
+    _removedSubsWritten.forEach(k => _intentionallyRemovedPushSubs.delete(k));
+    _clearedFinesWritten.forEach(k => _intentionallyClearedFines.delete(k));
+    _unblockedDaysWritten.forEach(d => _intentionallyUnblockedDays.delete(d));
+    _lastSyncedIds = _writtenIds;
+    if (_saveGen === _genAtStart) _savePending = false;
     _saveRetryCount = 0; // reset on success
     if (dot) dot.style.background = 'var(--green)';
   } catch(e) {
@@ -1979,6 +2030,7 @@ async function loadDB() {
         pushSubscriptions: remote.pushSubscriptions || APP.db.pushSubscriptions || {},
       };
       if (rows[0].updated_at) _lastRemoteUpdatedAt = rows[0].updated_at;
+      _lastSyncedIds = _snapshotSyncedIds(APP.db);
     } else {
       // Supabase returned nothing — try localStorage/IndexedDB backup before giving up
       await _tryLoadLocalBackup();
@@ -2200,11 +2252,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       showInstallBanner();
     }
   }, 600);
-  startLateCheckLoop();
+  // FIX: procesar las respuestas push pendientes ANTES de la primera pasada del loop de
+  // retrasos. Antes el loop arrancaba primero y, si la cita ya tenía >=15 min, la marcaba
+  // 'done' al instante; 4s después _processPendingPushAnswers() veía 'done' y descartaba
+  // la respuesta "No llegó" que el admin había dado desde la notificación.
+  _processPendingPushAnswers().finally(startLateCheckLoop);
   startReminderLoop();
   startRealTimeSync();
-  // Procesar respuestas push que llegaron mientras la app estaba cerrada (bug 1)
-  setTimeout(_processPendingPushAnswers, 4000);
   // Refrescar admin_sub en late_checks_pending por si la suscripción push se renovó
   // (garantiza que la push llega aunque el móvil esté apagado, igual que los recordatorios 24h)
   setTimeout(_refreshLateCheckSub, 5000);
@@ -2318,6 +2372,9 @@ async function _processPendingPushAnswers() {
     let changed = false;
     rows.forEach(row => {
       const apptId = row.appt_id;
+      // FIX: done=true solo indica que la push ya se disparó (ver _refreshLateCheckSub);
+      // sin respuesta explícita 'yes'/'no' del admin no se debe resolver como "No llegó".
+      if (row.answer !== 'yes' && row.answer !== 'no') return;
       const arrived = row.answer === 'yes';
       const appt = APP.db.appointments.find(a => a.id === apptId);
       if (!appt || !['pending','confirmed'].includes(appt.status)) return;
@@ -2637,6 +2694,10 @@ function acceptSwap(reqId) {
   _cancelLateCheckPush(toAppt.id);
   _scheduleLateCheckPush(fromAppt);
   _scheduleLateCheckPush(toAppt);
+  // Igual para el recordatorio 24h: su fila guarda fire_at y el texto con la hora antigua.
+  // Es un upsert por id (merge-duplicates), así que sobrescribe la fila existente.
+  _scheduleReminderPush(fromAppt);
+  _scheduleReminderPush(toAppt);
   // After swap: fromAppt.time = original toAppt time (requester's new time)
   //             toAppt.time  = original fromAppt time (acceptor's new time)
   const acceptorClient = APP.db.clients.find(c => c.id === toAppt.clientId);
@@ -3005,7 +3066,14 @@ function importData(input) {
       } catch(e) {}
       closeModal();
       showToast('Datos importados ✓ Recargando...', 'success');
-      setTimeout(() => location.reload(), 1500);
+      // FIX: recargar solo cuando el guardado en Supabase se haya confirmado. Antes se
+      // recargaba a los 1,5s fijos: si el push (lectura+escritura) seguía en vuelo, la
+      // recarga lo abortaba y loadDB() volvía a cargar los datos antiguos de Supabase.
+      const _reloadWhenSaved = () => {
+        if (_savePending) { setTimeout(_reloadWhenSaved, 500); return; }
+        location.reload();
+      };
+      setTimeout(_reloadWhenSaved, 1500);
     } catch(err) {
       showToast('Archivo inválido o corrupto: ' + (err.message || ''), 'error');
     }
@@ -3036,6 +3104,7 @@ function confirmClearPushSubs() {
 function doClearPushSubs() {
   const adminSub = APP.db.pushSubscriptions ? APP.db.pushSubscriptions['admin'] : null;
   // Conserva únicamente la suscripción del admin (si existe); borra el resto.
+  Object.keys(APP.db.pushSubscriptions || {}).forEach(k => { if (k !== 'admin') _intentionallyRemovedPushSubs.add(k); });
   APP.db.pushSubscriptions = adminSub ? { admin: adminSub } : {};
   saveDB();
   closeModal();
@@ -4110,6 +4179,7 @@ function confirmCancelFullDay(dateStr) {
   });
   if (!APP.db.blockedDays) APP.db.blockedDays = [];
   if (!APP.db.blockedDays.includes(dateStr)) APP.db.blockedDays.push(dateStr);
+  _intentionallyUnblockedDays.delete(dateStr); // FIX: re-bloqueo tras desbloqueo en la misma sesión
   // Notify admin with a summary of what was cancelled
   if (dayAppts.length > 0) {
     const _names = dayAppts.map(a => { const _cl = APP.db.clients.find(c => c.id === a.clientId); return getAdminName(a.clientId, _cl ? _cl.phone : '') || a.clientName; });
@@ -5687,6 +5757,7 @@ function confirmCancelAppt(id) {
   // justo antes), no volver a procesarla — evita aplicar una multa o duplicar notificaciones
   // por una cita que ya no existe.
   if (appt.status === 'cancelled') { showToast('Esta cita ya ha sido cancelada', 'info'); navigate('home'); return; }
+  if (['done','late','no-show'].includes(appt.status)) { showToast('Esta cita ya está cerrada', 'error'); navigate('home'); return; }
   const isAdmin = APP.isAdmin;
   const deadlineMs = !isAdmin ? getApptDeadlineMs(appt) : null;
   const msLeft = deadlineMs ? deadlineMs - Date.now() : 1; // admin always "in time"
@@ -8089,6 +8160,7 @@ function doPublishAlert() {
     while (d <= end) {
       const ds = formatDate(d);
       if (!APP.db.blockedDays.includes(ds)) APP.db.blockedDays.push(ds);
+      _intentionallyUnblockedDays.delete(ds); // FIX: re-bloqueo tras desbloqueo en la misma sesión
       d.setDate(d.getDate()+1);
     }
     // Notify admin with summary
@@ -8420,10 +8492,14 @@ function manualNoShow(apptId) {
     client.pendingFine = true;
     client.fineAmount = (client.fineAmount || 0) + 5;
     if (!client.cutHistory) client.cutHistory = [];
-    if (!client.cutHistory.find(h => h.apptId === appt.id)) {
+    const _histEntry = client.cutHistory.find(h => h.apptId === appt.id);
+    if (!_histEntry) {
       client.cutHistory.push({ apptId: appt.id, date: appt.date, time: appt.time, status: 'no-show', note: appt.note || '' });
-      client.totalCuts = client.cutHistory.filter(h => h.status !== 'no-show').length;
+    } else {
+      // La cita pudo marcarse 'done' automáticamente (>=15 min) mientras el modal estaba abierto
+      _histEntry.status = 'no-show';
     }
+    client.totalCuts = client.cutHistory.filter(h => h.status !== 'no-show').length;
   }
   appt.status = 'no-show';
   addNotif(appt.clientId, `🚫 No te presentaste a tu cita del ${formatDateHuman(appt.date)} a las ${appt.time}. Se ha aplicado una multa de <strong>+5€</strong> a tu próximo corte.`, 'cancel');
@@ -8444,7 +8520,10 @@ function lateCheckAnswer(arrived) {
   if (!arrived) {
     // "No llegó" → marcar como no-show + multa +5€ (mismo comportamiento que doNoShow)
     const apptObj = APP.db.appointments.find(a => a.id === appt.id);
-    if (apptObj && !['late','no-show'].includes(apptObj.status)) {
+    // FIX: solo resolver si la cita sigue abierta. lateCheckPending puede ser una copia
+    // obsoleta (p.ej. el cliente canceló o se cerró desde otro dispositivo mientras el
+    // overlay estaba abierto) — mismo criterio que el resto de rutas del late check.
+    if (apptObj && ['pending','confirmed'].includes(apptObj.status)) {
       const client = APP.db.clients.find(c => c.id === appt.clientId);
       if (client) {
         client.pendingFine = true;
@@ -8458,9 +8537,9 @@ function lateCheckAnswer(arrived) {
       apptObj.status = 'no-show';
       addNotif(appt.clientId, `🚫 No te presentaste a tu cita del ${formatDateHuman(apptObj.date)} a las ${apptObj.time}. Se aplica <strong>+5€</strong> de multa a tu próximo corte.`, 'cancel');
       // FIX bug6: no-show does NOT free the slot — notifyWaitlist intentionally NOT called here.
+      saveDB();
+      showToast('Marcado como no presentado. Multa +5€ aplicada.', 'info');
     }
-    saveDB();
-    showToast('Marcado como no presentado. Multa +5€ aplicada.', 'info');
     if (APP.currentPage === 'admin') {
       const card = document.getElementById('todayApptsCard');
       if (card) card.innerHTML = renderTodayAppts();
@@ -8471,7 +8550,7 @@ function lateCheckAnswer(arrived) {
   } else {
     // "Sí llegó" → marcar como realizada
     const apptObj = APP.db.appointments.find(a => a.id === appt.id);
-    if (apptObj && !['done','late','no-show'].includes(apptObj.status)) {
+    if (apptObj && ['pending','confirmed'].includes(apptObj.status)) {
       apptObj.status = 'done';
       const client = APP.db.clients.find(c => c.id === apptObj.clientId);
       if (client) {
@@ -8514,6 +8593,10 @@ function startRealTimeSync() {
       const rows = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
         headers: { 'Accept': 'application/json' }
       });
+      // FIX: un guardado local pudo empezar MIENTRAS esta lectura estaba en vuelo
+      // (hasta 12s en redes lentas). Volver a comprobarlo para no pisar con este
+      // snapshot remoto cambios locales que aún no se han subido.
+      if (_savePending) return;
       if (rows && rows.length > 0 && rows[0].data) {
         const remote = rows[0].data;
         const remoteTs = rows[0].updated_at;
@@ -8626,6 +8709,7 @@ function startRealTimeSync() {
             adminPhone: remote.adminPhone || APP.db.adminPhone,
           };
           _lastRemoteUpdatedAt = remoteTs || _lastRemoteUpdatedAt;
+          _lastSyncedIds = _snapshotSyncedIds(APP.db);
         }
         // Always check user validity after sync (even if we didn't apply remote data,
         // the user could have been deleted by admin on another device before our last push)
@@ -8784,11 +8868,17 @@ function checkDailyReset() {
     if (lastReset && lastReset < today) {
       const daysSinceReset = Math.floor((new Date(today) - new Date(lastReset)) / 86400000);
       if (daysSinceReset >= 2) {
+        const _beforeCleanup = APP.db.appointments;
         APP.db.appointments = APP.db.appointments.filter(a => {
           if (a.date > today) return true;
           if (a.date === today && ['pending','confirmed'].includes(a.status)) return true;
           return false;
         });
+        // FIX: esta limpieza es solo en memoria — quitar esos ids de la base sincronizada
+        // para que el merge de _pushDBToSupabase() no la trate como un borrado intencionado.
+        if (_lastSyncedIds) {
+          _beforeCleanup.forEach(a => { if (!APP.db.appointments.includes(a)) _lastSyncedIds.appointments.delete(a.id); });
+        }
         // No llamamos saveDB() — solo limpieza en memoria para esta sesión
       }
     }
@@ -9079,6 +9169,7 @@ async function registerPush() {
     const userId = APP.isAdmin ? 'admin' : (APP.currentUser && APP.currentUser.id || '');
     if (!APP.db.pushSubscriptions) APP.db.pushSubscriptions = {};
     APP.db.pushSubscriptions[userId] = sub.toJSON();
+    _intentionallyRemovedPushSubs.delete(userId);
     saveDB();
     showToast('✅ Notificaciones push activadas', 'success');
   } catch(e) {
@@ -9224,6 +9315,7 @@ async function sendPushToUser(userId, msg) {
     // 410 Gone = subscripción caducada — eliminarla para no seguir enviando a un endpoint muerto
     if (pushRes && pushRes.status === 410) {
       delete APP.db.pushSubscriptions[userId];
+      _intentionallyRemovedPushSubs.add(userId);
       saveDB();
     }
   } catch(e) { console.error('sendPush error:', e); }
