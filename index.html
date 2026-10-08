@@ -9755,15 +9755,28 @@ function generateSlots(start, end, durationMin=45) {
 // internet (servidor lento o caído), NO bloquea nada.
 // No toca ninguna otra lógica: solo observa las peticiones a Supabase
 // y los eventos online/offline.
+//
+// Seguridad para no dejarte bloqueado por error:
+//  - Confirma dos veces que no hay internet antes de mostrarse.
+//  - Ignora los fallos justo al volver a abrir la app o al volver la red.
+//  - Si lleva 45 s visible y el navegador dice que SÍ hay conexión, se
+//    quita solo y no vuelve a salir durante 2 minutos.
+//  - Interruptor de emergencia: localStorage.setItem('bb_no_offline_overlay','1')
 // =============================================
 (function () {
   'use strict';
   var ov = document.getElementById('offline-overlay');
   if (!ov || !window.fetch) return;
+  try { if (localStorage.getItem('bb_no_offline_overlay') === '1') return; } catch (e) {}
 
-  var FAIL_LIMIT = 2;      // fallos seguidos al servidor antes de comprobar si hay internet
-  var PROBE_EVERY = 3000;  // ms entre comprobaciones mientras el aviso está visible
-  var shown = false, checking = false, fails = 0, probeTimer = null, offlineTimer = null, locked = [];
+  var FAIL_LIMIT = 2;       // fallos seguidos al servidor antes de comprobar si hay internet
+  var PROBE_EVERY = 3000;   // ms entre comprobaciones mientras el aviso está visible
+  var RECHECK_AFTER = 1500; // ms entre las dos comprobaciones previas a mostrarse
+  var GRACE = 5000;         // ms de margen tras reabrir la app o volver la red
+  var MAX_STUCK = 45000;    // ms máximos visible si el navegador cree que hay conexión
+  var COOLDOWN = 120000;    // ms sin volver a salir tras quitarse por MAX_STUCK
+  var shown = false, checking = false, fails = 0, shownAt = 0, graceUntil = 0, suppressUntil = 0;
+  var probeTimer = null, offlineTimer = null, locked = [];
   var origFetch = window.fetch.bind(window);
 
   function appRunning() {
@@ -9797,8 +9810,8 @@ function generateSlots(start, end, durationMin=45) {
     probeTimer = setTimeout(probe, ms);
   }
   function show() {
-    if (shown || !appRunning()) return;
-    shown = true;
+    if (shown || !appRunning() || Date.now() < suppressUntil) return;
+    shown = true; shownAt = Date.now();
     lock();
     ov.classList.add('of-on');
     ov.setAttribute('aria-hidden', 'false');
@@ -9818,18 +9831,31 @@ function generateSlots(start, end, durationMin=45) {
   function probe() {
     probeTimer = null;
     if (!shown) return;
+    // Válvula de seguridad: si nuestra comprobación dice "sin internet" pero el navegador
+    // asegura que hay conexión durante demasiado rato, nos fiamos del navegador.
+    if (Date.now() - shownAt > MAX_STUCK && navigator.onLine !== false) {
+      suppressUntil = Date.now() + COOLDOWN;
+      hide();
+      return;
+    }
     checkInternet(function (up) {
       if (up) hide(); else scheduleProbe(PROBE_EVERY);
     });
   }
   // Tras varios fallos al servidor: ¿es que no hay internet, o solo falla el servidor?
+  // Se comprueba dos veces para no mostrarse por un microcorte.
   function verify() {
-    if (checking || shown) return;
+    if (checking || shown || Date.now() < suppressUntil) return;
     checking = true;
-    checkInternet(function (up) {
-      checking = false;
-      if (up) { fails = 0; return; }   // hay internet: el problema es del servidor, no se bloquea
-      show();
+    checkInternet(function (up1) {
+      if (up1) { checking = false; fails = 0; return; }   // hay internet: es el servidor, no se bloquea
+      setTimeout(function () {
+        checkInternet(function (up2) {
+          checking = false;
+          if (up2) { fails = 0; return; }
+          show();
+        });
+      }, RECHECK_AFTER);
     });
   }
   function isGatewayError(status) {
@@ -9837,7 +9863,7 @@ function generateSlots(start, end, durationMin=45) {
   }
   function netOk() { hide(); }          // si el servidor responde, hay internet
   function netFail() {
-    if (document.hidden) return;        // en segundo plano el móvil corta la red: no cuenta
+    if (document.hidden || Date.now() < graceUntil) return;   // segundo plano / recién reabierta
     fails++;
     if (fails >= FAIL_LIMIT) verify();
   }
@@ -9864,10 +9890,12 @@ function generateSlots(start, end, durationMin=45) {
   });
   window.addEventListener('online', function () {
     clearTimeout(offlineTimer);
+    graceUntil = Date.now() + GRACE;
+    fails = 0;
     if (shown) probe();
   });
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) fails = 0;
+    if (!document.hidden) { graceUntil = Date.now() + GRACE; fails = 0; }
   });
 })();
 </script>
