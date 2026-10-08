@@ -1363,8 +1363,12 @@ const VAPID_PUBLIC_KEY = 'BHAJteSkkiO8ljmfMhnUgPJhE_jUT_q0bHqeQrdCP1A5lQK7yJfcUY
 
 async function sbFetch(path, options = {}) {
   const controller = new AbortController();
+  // Tiempo máximo configurable por llamada (options.timeoutMs). Por defecto 12s como antes.
+  // Las lecturas/escrituras de la base completa (barberbook_db) pueden tardar más de 12s
+  // en móvil: abortarlas a los 12s hacía que nunca terminaran y los datos no se guardaban.
+  const { timeoutMs, ...fetchOptions } = options;
   // FIX: increased timeout from 8s to 12s — 8s was too aggressive on slow mobile connections
-  const timeoutId = setTimeout(() => controller.abort(), 12000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs || 12000);
   // Show a subtle toast if request takes >5s (slow mobile connection)
   const _slowTimer = setTimeout(() => {
     const c = document.getElementById('toastContainer');
@@ -1381,7 +1385,7 @@ async function sbFetch(path, options = {}) {
   };
   try {
     const res = await fetch(SUPABASE_URL + path, {
-      ...options,
+      ...fetchOptions,
       signal: controller.signal,
       headers: {
         'apikey': SUPABASE_KEY,
@@ -1552,6 +1556,66 @@ let _retryTimer = null; // handle for the pending retry setTimeout
 // Antes, un push antiguo que terminaba mientras había otro guardado debounced/en vuelo
 // ponía _savePending=false y el poll de 5s podía pisar ese cambio aún no subido.
 let _saveGen = 0;
+// Citas reservadas en ESTE dispositivo que aún no se han confirmado guardadas en Supabase.
+// Se guardan en localStorage para que, si el guardado falla y el cliente cierra la app,
+// la cita no se pierda: al volver a abrir (loadDB) se re-añade y se vuelve a subir.
+// Antes loadDB() reemplazaba las citas por las del servidor y la reserva desaparecía.
+const _UNSYNCED_APPTS_KEY = 'barberbook_unsynced_appts';
+function _getUnsyncedAppts() {
+  try {
+    const v = JSON.parse(localStorage.getItem(_UNSYNCED_APPTS_KEY) || '[]');
+    return Array.isArray(v) ? v.filter(x => x && x.id) : [];
+  } catch(e) { return []; }
+}
+function _setUnsyncedAppts(arr) {
+  try {
+    if (arr.length) localStorage.setItem(_UNSYNCED_APPTS_KEY, JSON.stringify(arr));
+    else localStorage.removeItem(_UNSYNCED_APPTS_KEY);
+  } catch(e) {}
+}
+function _markApptUnsynced(appt) {
+  const list = _getUnsyncedAppts().filter(x => x.id !== appt.id);
+  list.push({ ...appt });
+  _setUnsyncedAppts(list);
+}
+// Mantiene la copia guardada al día (p.ej. si el cliente cancela antes de que se suba).
+function _refreshUnsyncedAppts() {
+  const list = _getUnsyncedAppts();
+  if (!list.length) return;
+  _setUnsyncedAppts(list.map(x => {
+    const cur = (APP.db.appointments || []).find(a => a.id === x.id);
+    return cur ? { ...cur } : x;
+  }));
+}
+function _clearSyncedUnsyncedAppts(writtenApptIds) {
+  const list = _getUnsyncedAppts();
+  if (!list.length) return;
+  _setUnsyncedAppts(list.filter(x => !writtenApptIds.has(x.id)));
+}
+// Llamado tras cargar la base del servidor en loadDB().
+function _restoreUnsyncedAppts() {
+  const list = _getUnsyncedAppts();
+  if (!list.length) return;
+  const today = todayStr();
+  const ACTIVE = ['pending','confirmed'];
+  const restored = [];
+  list.forEach(p => {
+    if (!p.date || !p.time) return;
+    if (APP.db.appointments.some(a => a.id === p.id)) return; // ya está en el servidor
+    if (!ACTIVE.includes(p.status) || p.date < today) return; // cancelada o ya pasada
+    if (!APP.db.clients.some(c => c.id === p.clientId) && p.clientId !== 'admin') return;
+    // No crear doble reserva: hueco ocupado o el cliente ya tiene otra cita ese día
+    if (APP.db.appointments.some(a => ACTIVE.includes(a.status) && a.date === p.date &&
+        (a.time === p.time || a.clientId === p.clientId))) return;
+    APP.db.appointments.push({ ...p });
+    restored.push(p);
+  });
+  _setUnsyncedAppts(restored);
+  if (restored.length) {
+    saveDB();
+    restored.forEach(p => { _scheduleLateCheckPush(p); _scheduleReminderPush(p); });
+  }
+}
 // FIX: ids por colección del último estado sincronizado con Supabase (cargado, aplicado
 // desde el poll o escrito con éxito). Permite al merge de _pushDBToSupabase() distinguir
 // "el elemento lo borré yo localmente" (estaba en la base y ya no está en local → no
@@ -1587,6 +1651,7 @@ function saveDB() {
   _saveRetryCount = 0; // new save attempt resets retry counter
   if (_saveTimer) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => { _saveTimer = null; _pushDBToSupabase(); }, 800);
+  _refreshUnsyncedAppts();
   // Always write to IndexedDB immediately (more persistent than localStorage on Safari ITP)
   _idbSet('barberbook_db_backup', JSON.stringify(APP.db)).catch(() => {});
 }
@@ -1610,7 +1675,8 @@ async function _pushDBToSupabase() {
     let _expectedRemoteTs = null;
     try {
       const remote = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
-        headers: { 'Accept': 'application/json' }
+        headers: { 'Accept': 'application/json' },
+        timeoutMs: 30000
       });
       // sbFetch() no lanza: devuelve null ante error HTTP, timeout o fallo de red.
       // Sin esta comprobación, una lectura fallida seguía hacia el upsert sin fusionar.
@@ -1776,13 +1842,16 @@ async function _pushDBToSupabase() {
     const _unblockedDaysWritten = new Set(_intentionallyUnblockedDays);
     const _writtenIds = _snapshotSyncedIds(APP.db);
     if (_expectedRemoteTs) {
-      res = await sbFetch('/rest/v1/barberbook_db?id=eq.main&updated_at=eq.' + encodeURIComponent(_expectedRemoteTs), {
+      // select=updated_at: el servidor devuelve solo la fecha en vez de toda la base
+      // (antes la base completa viajaba de vuelta en cada guardado).
+      res = await sbFetch('/rest/v1/barberbook_db?id=eq.main&updated_at=eq.' + encodeURIComponent(_expectedRemoteTs) + '&select=updated_at', {
         method: 'PATCH',
         headers: {
           'Prefer': 'return=representation',
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ data: APP.db, updated_at: now })
+        body: JSON.stringify({ data: APP.db, updated_at: now }),
+        timeoutMs: 30000
       });
       if (res === null) throw new Error('Supabase update returned null');
       if (Array.isArray(res) && res.length === 0) {
@@ -1790,13 +1859,14 @@ async function _pushDBToSupabase() {
       }
     } else {
       // No se pudo leer un updated_at previo (p.ej. primera vez) — upsert normal.
-      res = await sbFetch('/rest/v1/barberbook_db', {
+      res = await sbFetch('/rest/v1/barberbook_db?select=updated_at', {
         method: 'POST',
         headers: {
           'Prefer': 'resolution=merge-duplicates,return=representation',
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ id: 'main', data: APP.db, updated_at: now })
+        body: JSON.stringify({ id: 'main', data: APP.db, updated_at: now }),
+        timeoutMs: 30000
       });
       if (res === null) throw new Error('Supabase upsert returned null');
     }
@@ -1808,6 +1878,7 @@ async function _pushDBToSupabase() {
     _clearedFinesWritten.forEach(k => _intentionallyClearedFines.delete(k));
     _unblockedDaysWritten.forEach(d => _intentionallyUnblockedDays.delete(d));
     _lastSyncedIds = _writtenIds;
+    _clearSyncedUnsyncedAppts(_writtenIds.appointments);
     if (_saveGen === _genAtStart) _savePending = false;
     _saveRetryCount = 0; // reset on success
     if (dot) dot.style.background = 'var(--green)';
@@ -1954,9 +2025,17 @@ async function loadSession() {
 
 async function loadDB() {
   try {
-    const rows = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
-      headers: { 'Accept': 'application/json' }
-    });
+    // Hasta 3 intentos (20s cada uno). Antes había un único intento de 12s: si el servidor
+    // iba lento, un cliente sin copia local se quedaba en la pantalla "Sin conexión".
+    let rows = null;
+    for (let _try = 0; _try < 3; _try++) {
+      rows = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
+        headers: { 'Accept': 'application/json' },
+        timeoutMs: 20000
+      });
+      if (rows !== null) break;
+      if (_try < 2) await new Promise(r => setTimeout(r, 2000));
+    }
     if (rows && rows.length > 0 && rows[0].data && Object.keys(rows[0].data).length > 0) {
       // Merge carefully: keep default schedule structure if remote is missing it
       const remote = rows[0].data;
@@ -2031,6 +2110,7 @@ async function loadDB() {
       };
       if (rows[0].updated_at) _lastRemoteUpdatedAt = rows[0].updated_at;
       _lastSyncedIds = _snapshotSyncedIds(APP.db);
+      _restoreUnsyncedAppts();
     } else {
       // Supabase returned nothing — try localStorage/IndexedDB backup before giving up
       await _tryLoadLocalBackup();
@@ -2362,8 +2442,8 @@ async function _saveLateCheckAnswer(apptId, arrived) {
 }
 
 // Al abrir la app, procesar respuestas push que quedaron pendientes mientras estaba cerrada.
-async function _processPendingPushAnswers() {
-  if (!APP.isAdmin) return;
+async function _processPendingPushAnswers(force) {
+  if (!APP.isAdmin && !force) return;
   try {
     const rows = await sbFetch('/rest/v1/late_checks_pending?done=eq.true&select=appt_id,answer', {
       headers: { 'Accept': 'application/json' }
@@ -3312,6 +3392,12 @@ async function loginAdmin() {
     err.textContent = 'PIN secreto incorrecto'; err.style.display='block'; return;
   }
 
+  // Procesar las respuestas push ("Sí, llegó"/"No llegó") dadas desde la notificación
+  // mientras no había sesión admin. Al arrancar sin sesión, _processPendingPushAnswers()
+  // salió sin hacer nada (APP.isAdmin=false) y el bucle de retrasos, ya en marcha,
+  // marcaría la cita como 'done' a los 15 min en cuanto APP.isAdmin pase a true.
+  // Se ejecuta ANTES de activar APP.isAdmin para que el bucle no actúe mientras tanto.
+  await _processPendingPushAnswers(true);
   APP.currentUser = { id: 'admin', name: APP.db.adminName, phone: APP.db.adminPhone };
   APP.isAdmin = true;
   saveSession();
@@ -4997,6 +5083,7 @@ function doConfirmBook() {
     bookedPrice: getEffectivePrice(bookState.date),
   };
   APP.db.appointments.push(appt);
+  _markApptUnsynced(appt);
   // Notify admin
   addNotif('admin', `📅 Nueva cita: <strong>${getAdminName(APP.currentUser.id, APP.currentUser.phone) || APP.currentUser.name}</strong> — ${formatDateHuman(bookState.date)} a las ${bookState.time}`);
   saveDB();
@@ -5937,6 +6024,9 @@ function confirmDoneAppt(id) {
   if (!APP.isAdmin) return;
   const appt = APP.db.appointments.find(a => a.id === id);
   if (!appt) return;
+  // Revalidar tras el modal: la cita pudo cancelarse/cerrarse (sync de 5s o bucle de
+  // retrasos) mientras el diálogo estaba abierto — mismo criterio que lateCheckAnswer().
+  if (!['pending','confirmed'].includes(appt.status)) { showToast('Esta cita ya no está activa', 'info'); navigate('appointments'); return; }
   appt.status = 'done';
   // Store amount paid for earnings tracking.
   // FIX: use appt.bookedPrice (saved at booking time) so that a later price change
@@ -8582,6 +8672,7 @@ function lateCheckAnswer(arrived) {
 // REMINDERS (24h before)
 // =============================================
 let _syncIntervalId = null;
+let _syncInFlight = false; // evita que se acumulen consultas si una tarda más de 5s
 
 function startRealTimeSync() {
   if (_syncIntervalId) return; // already running
@@ -8589,10 +8680,29 @@ function startRealTimeSync() {
   _syncIntervalId = setInterval(async () => {
     // Skip sync if a local save is debounced or in-flight — avoid overwriting unsaved local changes
     if (_savePending) return;
+    if (_syncInFlight) return;
+    _syncInFlight = true;
     try {
-      const rows = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
-        headers: { 'Accept': 'application/json' }
+      // Primero solo la fecha de última modificación (unos bytes). La base completa solo
+      // se descarga si ha cambiado. Antes se descargaba entera cada 5s en cada móvil abierto.
+      const _head = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=updated_at', {
+        headers: { 'Accept': 'application/json' },
+        timeoutMs: 30000
       });
+      if (_head === null) return;
+      const _headTs = (Array.isArray(_head) && _head[0]) ? _head[0].updated_at : null;
+      let rows;
+      if (_headTs && _lastRemoteUpdatedAt && !(_headTs > _lastRemoteUpdatedAt)) {
+        // Sin cambios en el servidor: mismo camino que antes cuando no había datos nuevos
+        // (shouldApply=false → solo se revalida el usuario con los datos locales).
+        rows = [{ data: {}, updated_at: _headTs }];
+      } else {
+        if (_savePending) return;
+        rows = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
+          headers: { 'Accept': 'application/json' },
+          timeoutMs: 30000
+        });
+      }
       // FIX: un guardado local pudo empezar MIENTRAS esta lectura estaba en vuelo
       // (hasta 12s en redes lentas). Volver a comprobarlo para no pisar con este
       // snapshot remoto cambios locales que aún no se han subido.
@@ -8809,7 +8919,7 @@ function startRealTimeSync() {
         }
         updateNotifBadge();
       }
-    } catch(e) {}
+    } catch(e) {} finally { _syncInFlight = false; }
   }, 5000);
 }
 
