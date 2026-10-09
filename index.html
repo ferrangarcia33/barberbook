@@ -1366,11 +1366,13 @@ async function sbFetch(path, options = {}) {
   // Tiempo máximo configurable por llamada (options.timeoutMs). Por defecto 12s como antes.
   // Las lecturas/escrituras de la base completa (barberbook_db) pueden tardar más de 12s
   // en móvil: abortarlas a los 12s hacía que nunca terminaran y los datos no se guardaban.
-  const { timeoutMs, ...fetchOptions } = options;
+  // options.silent: comprobaciones automáticas en segundo plano — no muestran el aviso
+  // "Conectando con el servidor..." (el usuario no está esperando nada).
+  const { timeoutMs, silent, ...fetchOptions } = options;
   // FIX: increased timeout from 8s to 12s — 8s was too aggressive on slow mobile connections
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs || 12000);
   // Show a subtle toast if request takes >5s (slow mobile connection)
-  const _slowTimer = setTimeout(() => {
+  const _slowTimer = silent ? null : setTimeout(() => {
     const c = document.getElementById('toastContainer');
     if (!c || document.getElementById('_sbSlowToast')) return;
     const t = document.createElement('div');
@@ -1379,6 +1381,7 @@ async function sbFetch(path, options = {}) {
     c.appendChild(t);
   }, 5000);
   const _clearSlowToast = () => {
+    if (silent) return; // no creó aviso — no borrar el de otra petición que sí lo creó
     clearTimeout(_slowTimer);
     const t = document.getElementById('_sbSlowToast');
     if (t) t.remove();
@@ -1674,10 +1677,22 @@ async function _pushDBToSupabase() {
     // Solo mergeamos appointments (el array más crítico) — el resto lo gana el local.
     let _expectedRemoteTs = null;
     try {
-      const remote = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
-        headers: { 'Accept': 'application/json' },
-        timeoutMs: 30000
+      // Primero solo updated_at (unos bytes). Si coincide con la última versión que este
+      // dispositivo ya tiene (la escribió o la cargó), nadie ha guardado desde entonces y
+      // no hace falta descargar la base entera para fusionar. La escritura sigue siendo
+      // condicional (updated_at=eq.) así que si alguien guarda justo entre medias, falla
+      // y el reintento hace la lectura completa + fusión como siempre.
+      const _preHead = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=updated_at', {
+        headers: { 'Accept': 'application/json' }
       });
+      if (_preHead === null) throw new Error('Lectura remota fallida');
+      const _preTs = (Array.isArray(_preHead) && _preHead[0]) ? _preHead[0].updated_at : null;
+      const remote = (_preTs && _lastRemoteUpdatedAt && _preTs === _lastRemoteUpdatedAt)
+        ? [{ updated_at: _preTs }]
+        : await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
+            headers: { 'Accept': 'application/json' },
+            timeoutMs: 30000
+          });
       // sbFetch() no lanza: devuelve null ante error HTTP, timeout o fallo de red.
       // Sin esta comprobación, una lectura fallida seguía hacia el upsert sin fusionar.
       if (remote === null) throw new Error('Lectura remota fallida');
@@ -8687,7 +8702,7 @@ function startRealTimeSync() {
       // se descarga si ha cambiado. Antes se descargaba entera cada 5s en cada móvil abierto.
       const _head = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=updated_at', {
         headers: { 'Accept': 'application/json' },
-        timeoutMs: 30000
+        silent: true
       });
       if (_head === null) return;
       const _headTs = (Array.isArray(_head) && _head[0]) ? _head[0].updated_at : null;
@@ -8700,7 +8715,8 @@ function startRealTimeSync() {
         if (_savePending) return;
         rows = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
           headers: { 'Accept': 'application/json' },
-          timeoutMs: 30000
+          timeoutMs: 30000,
+          silent: true
         });
       }
       // FIX: un guardado local pudo empezar MIENTRAS esta lectura estaba en vuelo
@@ -9350,11 +9366,21 @@ async function _refreshLateCheckSub() {
     if (!APP.isAdmin) return;
     const adminSub = APP.db.pushSubscriptions && APP.db.pushSubscriptions['admin'];
     if (!adminSub) return;
-    // Solo actualizamos los que aún no han disparado (done=false)
-    await sbFetch('/rest/v1/late_checks_pending?done=eq.false', {
+    // Avisos que debían haber salido hace más de 15 min y siguen sin enviarse: ya no sirven
+    // (a los 15 min la app da la cita por realizada). Antes, la línea de abajo les ponía la
+    // suscripción nueva y el servidor los podía enviar en ese momento, horas tarde.
+    // Solo filas done=false (sin respuesta del admin), así que no se pierde ninguna respuesta.
+    const _staleIso = new Date(Date.now() - 15 * 60000).toISOString();
+    await sbFetch('/rest/v1/late_checks_pending?done=eq.false&fire_at=lt.' + encodeURIComponent(_staleIso), {
+      method: 'DELETE',
+      silent: true
+    });
+    // Solo actualizamos los que aún no han disparado (done=false) y todavía no ha llegado su hora
+    await sbFetch('/rest/v1/late_checks_pending?done=eq.false&fire_at=gt.' + encodeURIComponent(new Date().toISOString()), {
       method: 'PATCH',
       headers: { 'Prefer': 'return=minimal' },
-      body: JSON.stringify({ admin_sub: adminSub })
+      body: JSON.stringify({ admin_sub: adminSub }),
+      silent: true
     });
   } catch(e) { console.warn('_refreshLateCheckSub error:', e); }
 }
