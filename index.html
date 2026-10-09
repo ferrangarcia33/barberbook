@@ -1576,10 +1576,44 @@ function _setUnsyncedAppts(arr) {
     else localStorage.removeItem(_UNSYNCED_APPTS_KEY);
   } catch(e) {}
 }
-function _markApptUnsynced(appt) {
+function _markApptUnsynced(appt, adminMsg) {
   const list = _getUnsyncedAppts().filter(x => x.id !== appt.id);
   list.push({ ...appt });
   _setUnsyncedAppts(list);
+  if (adminMsg) { const m = _getUnsyncedNotify(); m[appt.id] = adminMsg; _setUnsyncedNotify(m); }
+}
+// Aviso al barbero pendiente por cada reserva: se envía SOLO cuando el servidor confirma
+// que la cita está guardada. Antes el aviso salía al instante aunque el guardado fallase.
+const _UNSYNCED_NOTIFY_KEY = 'barberbook_unsynced_notify';
+function _getUnsyncedNotify() {
+  try {
+    const v = JSON.parse(localStorage.getItem(_UNSYNCED_NOTIFY_KEY) || '{}');
+    return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
+  } catch(e) { return {}; }
+}
+function _setUnsyncedNotify(o) {
+  try {
+    if (Object.keys(o).length) localStorage.setItem(_UNSYNCED_NOTIFY_KEY, JSON.stringify(o));
+    else localStorage.removeItem(_UNSYNCED_NOTIFY_KEY);
+  } catch(e) {}
+}
+function _dropBookingNotify(apptId) {
+  const m = _getUnsyncedNotify();
+  if (apptId in m) { delete m[apptId]; _setUnsyncedNotify(m); }
+}
+// La reserva ya está guardada en el servidor: ahora sí avisar al barbero y programar
+// el aviso de retraso y el recordatorio (antes se programaban aunque no se guardase).
+function _onBookingConfirmed(apptId) {
+  const m = _getUnsyncedNotify();
+  if (!(apptId in m)) return;
+  const msg = m[apptId];
+  delete m[apptId];
+  _setUnsyncedNotify(m);
+  const appt = APP.db.appointments.find(a => a.id === apptId);
+  if (!appt || !['pending','confirmed'].includes(appt.status)) return;
+  if (!APP.isAdmin) sendPushToUser('admin', msg);
+  _scheduleLateCheckPush(appt);
+  _scheduleReminderPush(appt);
 }
 // Mantiene la copia guardada al día (p.ej. si el cliente cancela antes de que se suba).
 function _refreshUnsyncedAppts() {
@@ -1594,6 +1628,7 @@ function _clearSyncedUnsyncedAppts(writtenApptIds) {
   const list = _getUnsyncedAppts();
   if (!list.length) return;
   _setUnsyncedAppts(list.filter(x => !writtenApptIds.has(x.id)));
+  list.filter(x => writtenApptIds.has(x.id)).forEach(x => { try { _onBookingConfirmed(x.id); } catch(e) {} });
 }
 // Llamado tras cargar la base del servidor en loadDB().
 function _restoreUnsyncedAppts() {
@@ -1603,20 +1638,25 @@ function _restoreUnsyncedAppts() {
   const ACTIVE = ['pending','confirmed'];
   const restored = [];
   list.forEach(p => {
-    if (!p.date || !p.time) return;
-    if (APP.db.appointments.some(a => a.id === p.id)) return; // ya está en el servidor
-    if (!ACTIVE.includes(p.status) || p.date < today) return; // cancelada o ya pasada
-    if (!APP.db.clients.some(c => c.id === p.clientId) && p.clientId !== 'admin') return;
+    if (!p.date || !p.time) { _dropBookingNotify(p.id); return; }
+    // Ya está en el servidor (se guardó pero este móvil no llegó a recibir la confirmación)
+    if (APP.db.appointments.some(a => a.id === p.id)) { _onBookingConfirmed(p.id); return; }
+    if (!ACTIVE.includes(p.status) || p.date < today) { _dropBookingNotify(p.id); return; } // cancelada o ya pasada
+    if (!APP.db.clients.some(c => c.id === p.clientId) && p.clientId !== 'admin') { _dropBookingNotify(p.id); return; }
     // No crear doble reserva: hueco ocupado o el cliente ya tiene otra cita ese día
     if (APP.db.appointments.some(a => ACTIVE.includes(a.status) && a.date === p.date &&
-        (a.time === p.time || a.clientId === p.clientId))) return;
+        (a.time === p.time || a.clientId === p.clientId))) { _dropBookingNotify(p.id); return; }
     APP.db.appointments.push({ ...p });
     restored.push(p);
   });
   _setUnsyncedAppts(restored);
   if (restored.length) {
+    const _notify = _getUnsyncedNotify();
+    restored.forEach(p => {
+      if (_notify[p.id]) addNotif('admin', _notify[p.id], '', '', true); // el aviso se perdió con la cita
+      else { _scheduleLateCheckPush(p); _scheduleReminderPush(p); }      // reservas de la versión anterior
+    });
     saveDB();
-    restored.forEach(p => { _scheduleLateCheckPush(p); _scheduleReminderPush(p); });
   }
 }
 // FIX: ids por colección del último estado sincronizado con Supabase (cargado, aplicado
@@ -5098,14 +5138,50 @@ function doConfirmBook() {
     bookedPrice: getEffectivePrice(bookState.date),
   };
   APP.db.appointments.push(appt);
-  _markApptUnsynced(appt);
-  // Notify admin
-  addNotif('admin', `📅 Nueva cita: <strong>${getAdminName(APP.currentUser.id, APP.currentUser.phone) || APP.currentUser.name}</strong> — ${formatDateHuman(bookState.date)} a las ${bookState.time}`);
+  const _newApptMsg = `📅 Nueva cita: <strong>${getAdminName(APP.currentUser.id, APP.currentUser.phone) || APP.currentUser.name}</strong> — ${formatDateHuman(bookState.date)} a las ${bookState.time}`;
+  _markApptUnsynced(appt, _newApptMsg);
+  // Notify admin — la push al barbero se envía en _onBookingConfirmed(), cuando el servidor
+  // confirma el guardado (antes salía al instante aunque la cita no llegase a guardarse).
+  addNotif('admin', _newApptMsg, '', '', true);
   saveDB();
-  _scheduleLateCheckPush(appt);
-  _scheduleReminderPush(appt);
-  showToast('✓ Cita confirmada', 'success');
   navigate('home');
+  _waitBookingSaved(appt.id);
+}
+
+// Muestra "Guardando tu reserva…" y solo dice "Cita confirmada" cuando el servidor la tiene.
+function _waitBookingSaved(apptId) {
+  const _isPending = () => _getUnsyncedAppts().some(x => x.id === apptId);
+  if (!_isPending()) { showToast('✓ Cita confirmada', 'success'); return; }
+  openModal('⏳ Guardando tu reserva', `<div id="_bookSavingBox" style="text-align:center;padding:10px 0 16px">
+      <div style="font-size:2.5rem;margin-bottom:10px">⏳</div>
+      <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:8px">Guardando tu reserva…</div>
+      <div style="font-size:0.82rem;color:var(--text3);line-height:1.5">No cierres la app hasta que se confirme.</div>
+    </div>`);
+  const started = Date.now();
+  let warned = false;
+  const iv = setInterval(() => {
+    const box = document.getElementById('_bookSavingBox');
+    const modalOpen = document.getElementById('modal').classList.contains('open');
+    if (!_isPending()) {
+      clearInterval(iv);
+      if (modalOpen && (box || document.getElementById('_bookSlowBox'))) closeModal();
+      showToast('✓ Cita confirmada', 'success');
+      if (APP.currentPage === 'home') navigate('home');
+      return;
+    }
+    if (!warned && Date.now() - started > 45000) {
+      warned = true;
+      if (modalOpen && box) {
+        openModal('⚠️ Reserva sin confirmar', `<div id="_bookSlowBox" style="text-align:center;padding:10px 0 16px">
+            <div style="font-size:2.5rem;margin-bottom:10px">⚠️</div>
+            <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:8px">Tu reserva aún no está guardada</div>
+            <div style="font-size:0.82rem;color:var(--text3);line-height:1.5">El servidor va lento. Seguimos intentándolo: deja la app abierta.<br>Si la cierras, se guardará cuando vuelvas a abrirla. El barbero recibirá el aviso cuando quede guardada.</div>
+          </div>
+          <button class="btn btn-gold" onclick="closeModal()">Entendido</button>`);
+      }
+    }
+    if (Date.now() - started > 15 * 60000) clearInterval(iv); // deja de vigilar; el guardado sigue reintentando
+  }, 300);
 }
 
 // Out-of-hours request
