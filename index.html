@@ -1582,8 +1582,8 @@ function _markApptUnsynced(appt, adminMsg) {
   _setUnsyncedAppts(list);
   if (adminMsg) { const m = _getUnsyncedNotify(); m[appt.id] = adminMsg; _setUnsyncedNotify(m); }
 }
-// Aviso al barbero pendiente por cada reserva: se envía SOLO cuando el servidor confirma
-// que la cita está guardada. Antes el aviso salía al instante aunque el guardado fallase.
+// Texto del aviso de cada reserva sin confirmar: si la cita se pierde al recargar y se
+// recupera, se vuelve a añadir a la lista de notificaciones del barbero (sin repetir la push).
 const _UNSYNCED_NOTIFY_KEY = 'barberbook_unsynced_notify';
 function _getUnsyncedNotify() {
   try {
@@ -1601,8 +1601,8 @@ function _dropBookingNotify(apptId) {
   const m = _getUnsyncedNotify();
   if (apptId in m) { delete m[apptId]; _setUnsyncedNotify(m); }
 }
-// La reserva ya está guardada en el servidor: ahora sí avisar al barbero y programar
-// el aviso de retraso y el recordatorio (antes se programaban aunque no se guardase).
+// La reserva ya está guardada en el servidor: ahora sí programar el aviso de retraso y el
+// recordatorio (antes se programaban aunque no se guardase). La push al barbero sale al reservar.
 function _onBookingConfirmed(apptId) {
   const m = _getUnsyncedNotify();
   if (!(apptId in m)) return;
@@ -1611,7 +1611,6 @@ function _onBookingConfirmed(apptId) {
   _setUnsyncedNotify(m);
   const appt = APP.db.appointments.find(a => a.id === apptId);
   if (!appt || !['pending','confirmed'].includes(appt.status)) return;
-  if (!APP.isAdmin) sendPushToUser('admin', msg);
   _scheduleLateCheckPush(appt);
   _scheduleReminderPush(appt);
 }
@@ -5140,9 +5139,8 @@ function doConfirmBook() {
   APP.db.appointments.push(appt);
   const _newApptMsg = `📅 Nueva cita: <strong>${getAdminName(APP.currentUser.id, APP.currentUser.phone) || APP.currentUser.name}</strong> — ${formatDateHuman(bookState.date)} a las ${bookState.time}`;
   _markApptUnsynced(appt, _newApptMsg);
-  // Notify admin — la push al barbero se envía en _onBookingConfirmed(), cuando el servidor
-  // confirma el guardado (antes salía al instante aunque la cita no llegase a guardarse).
-  addNotif('admin', _newApptMsg, '', '', true);
+  // Notify admin — la push al barbero sale al instante, nada más reservar
+  addNotif('admin', _newApptMsg);
   saveDB();
   navigate('home');
   _waitBookingSaved(appt.id);
@@ -5175,7 +5173,7 @@ function _waitBookingSaved(apptId) {
         openModal('⚠️ Reserva sin confirmar', `<div id="_bookSlowBox" style="text-align:center;padding:10px 0 16px">
             <div style="font-size:2.5rem;margin-bottom:10px">⚠️</div>
             <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:8px">Tu reserva aún no está guardada</div>
-            <div style="font-size:0.82rem;color:var(--text3);line-height:1.5">El servidor va lento. Seguimos intentándolo: deja la app abierta.<br>Si la cierras, se guardará cuando vuelvas a abrirla. El barbero recibirá el aviso cuando quede guardada.</div>
+            <div style="font-size:0.82rem;color:var(--text3);line-height:1.5">El servidor va lento. Seguimos intentándolo: deja la app abierta.<br>Si la cierras, se guardará cuando vuelvas a abrirla.</div>
           </div>
           <button class="btn btn-gold" onclick="closeModal()">Entendido</button>`);
       }
