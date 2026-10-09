@@ -2081,14 +2081,24 @@ async function loadDB() {
   try {
     // Hasta 3 intentos (20s cada uno). Antes había un único intento de 12s: si el servidor
     // iba lento, un cliente sin copia local se quedaba en la pantalla "Sin conexión".
+    // Si este móvil ya tiene una copia local válida, NO hacer esperar: un solo intento corto
+    // y, si el servidor tarda, entrar con la copia local (la sincronización de cada 5s trae
+    // luego los datos del servidor). Los 3 intentos largos son solo para móviles sin copia,
+    // que no pueden entrar sin el servidor. Antes todos esperaban hasta ~1 minuto.
+    let _hasLocalBackup = false;
+    try {
+      const _b = JSON.parse(localStorage.getItem('barberbook_db_backup') || 'null');
+      _hasLocalBackup = !!(_b && _b.adminPin);
+    } catch(e) {}
+    const _attempts = _hasLocalBackup ? 1 : 3;
     let rows = null;
-    for (let _try = 0; _try < 3; _try++) {
+    for (let _try = 0; _try < _attempts; _try++) {
       rows = await sbFetch('/rest/v1/barberbook_db?id=eq.main&select=data,updated_at', {
         headers: { 'Accept': 'application/json' },
-        timeoutMs: 20000
+        timeoutMs: _hasLocalBackup ? 3000 : 20000
       });
       if (rows !== null) break;
-      if (_try < 2) await new Promise(r => setTimeout(r, 2000));
+      if (_try < _attempts - 1) await new Promise(r => setTimeout(r, 2000));
     }
     if (rows && rows.length > 0 && rows[0].data && Object.keys(rows[0].data).length > 0) {
       // Merge carefully: keep default schedule structure if remote is missing it
@@ -8910,6 +8920,9 @@ function startRealTimeSync() {
           };
           _lastRemoteUpdatedAt = remoteTs || _lastRemoteUpdatedAt;
           _lastSyncedIds = _snapshotSyncedIds(APP.db);
+          // Si este móvil arrancó con la copia local y tenía una reserva sin subir, los datos
+          // del servidor la acaban de quitar de la pantalla: volver a añadirla y subirla.
+          _restoreUnsyncedAppts();
         }
         // Always check user validity after sync (even if we didn't apply remote data,
         // the user could have been deleted by admin on another device before our last push)
