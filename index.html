@@ -1658,6 +1658,55 @@ function _restoreUnsyncedAppts() {
     saveDB();
   }
 }
+// FIX: igual que las citas (_markApptUnsynced), las solicitudes fuera de horario creadas en
+// ESTE dispositivo se guardan en localStorage hasta confirmar que Supabase las tiene. Antes,
+// si el guardado no terminaba (servidor lento) y el cliente cerraba la app, loadDB() cargaba
+// las solicitudes del servidor y la nueva desaparecía, aunque al barbero ya le había llegado la push.
+const _UNSYNCED_OOH_KEY = 'barberbook_unsynced_ooh';
+function _getUnsyncedOOH() {
+  try {
+    const v = JSON.parse(localStorage.getItem(_UNSYNCED_OOH_KEY) || '[]');
+    return Array.isArray(v) ? v.filter(x => x && x.id) : [];
+  } catch(e) { return []; }
+}
+function _setUnsyncedOOH(arr) {
+  try {
+    if (arr.length) localStorage.setItem(_UNSYNCED_OOH_KEY, JSON.stringify(arr));
+    else localStorage.removeItem(_UNSYNCED_OOH_KEY);
+  } catch(e) {}
+}
+function _markOOHUnsynced(req) {
+  const list = _getUnsyncedOOH().filter(x => x.id !== req.id);
+  list.push({ ...req });
+  _setUnsyncedOOH(list);
+}
+function _clearSyncedUnsyncedOOH(writtenOOHIds) {
+  const list = _getUnsyncedOOH();
+  if (!list.length) return;
+  _setUnsyncedOOH(list.filter(x => !writtenOOHIds.has(x.id)));
+}
+// Llamado tras aplicar los datos del servidor (loadDB y poll). remoteArr = oohRequests del servidor.
+function _restoreUnsyncedOOH(remoteArr) {
+  const list = _getUnsyncedOOH();
+  if (!list.length) return;
+  const remoteIds = new Set((Array.isArray(remoteArr) ? remoteArr : []).map(r => r && r.id));
+  const now = new Date();
+  const keep = [];
+  let needSave = false;
+  list.forEach(r => {
+    if (remoteIds.has(r.id)) return;                       // ya está en el servidor
+    if (r.status !== 'pending' || !r.date || !r.time) return;
+    const [y, mo, d] = r.date.split('-').map(Number);
+    const [h, m] = r.time.split(':').map(Number);
+    if (now >= new Date(y, mo - 1, d, h, m, 0, 0)) return;  // la hora ya pasó
+    keep.push(r);
+    if (!Array.isArray(APP.db.oohRequests)) APP.db.oohRequests = [];
+    if (!APP.db.oohRequests.some(x => x.id === r.id)) APP.db.oohRequests.push({ ...r });
+    needSave = true;
+  });
+  _setUnsyncedOOH(keep);
+  if (needSave) saveDB();
+}
 // FIX: ids por colección del último estado sincronizado con Supabase (cargado, aplicado
 // desde el poll o escrito con éxito). Permite al merge de _pushDBToSupabase() distinguir
 // "el elemento lo borré yo localmente" (estaba en la base y ya no está en local → no
@@ -1778,7 +1827,18 @@ async function _pushDBToSupabase() {
           const localOOH = APP.db.oohRequests || [];
           const localIds = new Set(localOOH.map(r => r.id));
           const onlyRemote = remoteData.oohRequests.filter(r => !localIds.has(r.id) && !_wasSyncedAndRemoved('oohRequests', r.id));
-          APP.db.oohRequests = [...localOOH, ...onlyRemote];
+          // FIX: misma protección por estado que swapRequests (abajo) y que el poll
+          // (mergeByStatus): si el remoto ya está aceptado/rechazado y la copia local sigue
+          // "pending" (desactualizada), gana el remoto. Antes ganaba siempre el local y un
+          // dispositivo atrasado devolvía a "pending" una solicitud ya aceptada por el barbero.
+          const _oohRank = { pending: 0, accepted: 1, rejected: 1 };
+          const _remoteOOHById = new Map(remoteData.oohRequests.map(r => [r.id, r]));
+          const _keptLocalOOH = localOOH.map(loc => {
+            const rr = _remoteOOHById.get(loc.id);
+            if (rr && (_oohRank[rr.status] || 0) > (_oohRank[loc.status] || 0)) return rr;
+            return loc;
+          });
+          APP.db.oohRequests = [..._keptLocalOOH, ...onlyRemote];
         }
 
         // FIX: swapRequests no estaba protegido al guardar — solo se protegía al leer/
@@ -1933,6 +1993,7 @@ async function _pushDBToSupabase() {
     _unblockedDaysWritten.forEach(d => _intentionallyUnblockedDays.delete(d));
     _lastSyncedIds = _writtenIds;
     _clearSyncedUnsyncedAppts(_writtenIds.appointments);
+    _clearSyncedUnsyncedOOH(_writtenIds.oohRequests);
     if (_saveGen === _genAtStart) _savePending = false;
     _saveRetryCount = 0; // reset on success
     if (dot) dot.style.background = 'var(--green)';
@@ -2175,6 +2236,7 @@ async function loadDB() {
       if (rows[0].updated_at) _lastRemoteUpdatedAt = rows[0].updated_at;
       _lastSyncedIds = _snapshotSyncedIds(APP.db);
       _restoreUnsyncedAppts();
+      _restoreUnsyncedOOH(remote.oohRequests);
     } else {
       // Supabase returned nothing — try localStorage/IndexedDB backup before giving up
       await _tryLoadLocalBackup();
@@ -5343,6 +5405,7 @@ function submitOOH() {
   if (duplicatePending) { showToast('Ya tienes una solicitud pendiente para esa hora', 'error'); return; }
   const req = { id: uid(), clientId: APP.currentUser.id, clientName: APP.currentUser.name, date, time, note, status:'pending' };
   APP.db.oohRequests.push(req);
+  _markOOHUnsynced(req);
   addNotif('admin', `🕐 Solicitud fuera de horario: <strong>${getAdminName(APP.currentUser.id, APP.currentUser.phone) || APP.currentUser.name}</strong> — ${date === todayStr() ? '<strong style="color:var(--blue)">(HOY)</strong> ' : date === formatDate(new Date(Date.now()+86400000)) ? '<strong style="color:var(--gold)">(MAÑANA)</strong> ' : ''}${formatDateHuman(date)} a las ${time}`, 'ooh', req.id);
   saveDB();
   closeModal();
@@ -8923,6 +8986,7 @@ function startRealTimeSync() {
           // Si este móvil arrancó con la copia local y tenía una reserva sin subir, los datos
           // del servidor la acaban de quitar de la pantalla: volver a añadirla y subirla.
           _restoreUnsyncedAppts();
+          _restoreUnsyncedOOH(remote.oohRequests);
         }
         // Always check user validity after sync (even if we didn't apply remote data,
         // the user could have been deleted by admin on another device before our last push)
