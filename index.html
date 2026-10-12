@@ -9752,7 +9752,11 @@ function showEarningsDetail(type) {
   const colors = { normal: 'var(--text)', ooh: 'var(--blue)', fines: 'var(--red)', tips: 'var(--green)' };
   // Tips: build details on the fly from tipsStandalone
   if (type === 'tips') {
-    const _tipsAll = (APP.db.tipsStandalone || []);
+    // FIX: mostrar solo las propinas del mes seleccionado (mismo filtro que el total del resumen)
+    const _tipsAll = (APP.db.tipsStandalone || []).filter(t => {
+      const d = parseDate(t.date);
+      return d.getFullYear() === bookState.calYear && d.getMonth() === bookState.calMonth;
+    });
     const sorted = _tipsAll.slice().sort((a,b) => (b.date||'').localeCompare(a.date||''));
     let body = `<div style="display:flex;flex-direction:column;gap:8px;max-height:60vh;overflow-y:auto">`;
     if (!sorted.length) body += '<div style="text-align:center;color:var(--text3);font-size:0.85rem;padding:16px">Sin propinas registradas</div>';
