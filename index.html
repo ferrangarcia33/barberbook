@@ -1727,6 +1727,42 @@ function _snapshotSyncedIds(db) {
 function _wasSyncedAndRemoved(kind, id) {
   return !!(_lastSyncedIds && _lastSyncedIds[kind] && _lastSyncedIds[kind].has(id));
 }
+// FIX: importe de multa pendiente de cada cliente en el último estado sincronizado con
+// Supabase (cargado, aplicado desde el poll o escrito con éxito). Permite al merge
+// distinguir "la multa se quitó en otro dispositivo" (local sigue igual que la base y
+// remoto ya no la tiene → aceptar el borrado) de "la multa se acaba de poner aquí y aún
+// no se ha subido" (local distinto de la base → conservarla). Sin esto, cualquier otro
+// dispositivo abierto con la multa en memoria la volvía a escribir en Supabase.
+let _lastSyncedFines = null;
+function _snapshotSyncedFines(clients) {
+  const m = new Map();
+  (Array.isArray(clients) ? clients : []).forEach(c => {
+    if (c && c.id) m.set(c.id, c.pendingFine ? (c.fineAmount || 0) : 0);
+  });
+  return m;
+}
+// FIX: valor (JSON) de cada clave de primer nivel en el último estado sincronizado con
+// Supabase (cargado, aplicado desde el poll o escrito con éxito). Las claves que el merge
+// de _pushDBToSupabase() no fusiona de forma específica (schedule, cutPrice, normas,
+// blockedSlots, alerts, allowedPhones, cancelWaitlist, adminPin...) se escribían siempre
+// con el valor local: un dispositivo con una copia atrasada que guardaba cualquier cosa
+// revertía en Supabase los cambios hechos en otro dispositivo. Con esta base, si la clave
+// no ha cambiado localmente desde la última sincronización, se toma el valor remoto.
+// null = sin base fiable (p.ej. arranque desde copia local) → comportamiento anterior.
+let _lastSyncedData = null;
+const _SPECIAL_MERGE_KEYS = new Set(['appointments','notifications','oohRequests','swapRequests','pushSubscriptions','blockedDays','clients']);
+function _snapshotSyncedData(db) {
+  const m = new Map();
+  if (db && typeof db === 'object') {
+    Object.keys(db).forEach(k => { try { m.set(k, JSON.stringify(db[k])); } catch(e) {} });
+  }
+  return m;
+}
+function _fineClearedRemotely(lc, rc) {
+  if (!lc.pendingFine || rc.pendingFine || !_lastSyncedFines) return false;
+  const base = _lastSyncedFines.get(lc.id);
+  return typeof base === 'number' && base > 0 && (lc.fineAmount || 0) === base;
+}
 
 function saveDB() {
   // Show syncing indicator
@@ -1908,6 +1944,10 @@ async function _pushDBToSupabase() {
             if (!lc.pendingFine && rc.pendingFine && !_intentionallyClearedFines.has(lc.id)) {
               merged2.pendingFine = true;
               merged2.fineAmount = rc.fineAmount;
+            } else if (_fineClearedRemotely(lc, rc)) {
+              // FIX: multa pagada/cancelada en otro dispositivo — no resucitarla desde local.
+              merged2.pendingFine = false;
+              merged2.fineAmount = rc.fineAmount || 0;
             } else {
               merged2.pendingFine = !!(lc.pendingFine || rc.pendingFine) && lc.pendingFine && ((merged2.fineAmount || 0) > 0);
             }
@@ -1930,6 +1970,17 @@ async function _pushDBToSupabase() {
           if (onlyRemoteClients.length) {
             APP.db.clients = [...APP.db.clients, ...onlyRemoteClients];
           }
+        }
+
+        // FIX: resto de claves — si este dispositivo no las ha modificado desde la última
+        // sincronización, prevalece el valor remoto (no revertir cambios de otro dispositivo).
+        if (_lastSyncedData) {
+          Object.keys(remoteData).forEach(k => {
+            if (_SPECIAL_MERGE_KEYS.has(k)) return;
+            let _localStr;
+            try { _localStr = JSON.stringify(APP.db[k]); } catch(e) { return; }
+            if (_localStr === _lastSyncedData.get(k)) APP.db[k] = remoteData[k];
+          });
         }
       }
     } catch(e) {
@@ -1955,6 +2006,8 @@ async function _pushDBToSupabase() {
     const _clearedFinesWritten = new Set(_intentionallyClearedFines);
     const _unblockedDaysWritten = new Set(_intentionallyUnblockedDays);
     const _writtenIds = _snapshotSyncedIds(APP.db);
+    const _writtenFines = _snapshotSyncedFines(APP.db.clients);
+    const _writtenData = _snapshotSyncedData(APP.db);
     if (_expectedRemoteTs) {
       // select=updated_at: el servidor devuelve solo la fecha en vez de toda la base
       // (antes la base completa viajaba de vuelta en cada guardado).
@@ -1992,6 +2045,8 @@ async function _pushDBToSupabase() {
     _clearedFinesWritten.forEach(k => _intentionallyClearedFines.delete(k));
     _unblockedDaysWritten.forEach(d => _intentionallyUnblockedDays.delete(d));
     _lastSyncedIds = _writtenIds;
+    _lastSyncedFines = _writtenFines;
+    _lastSyncedData = _writtenData;
     _clearSyncedUnsyncedAppts(_writtenIds.appointments);
     _clearSyncedUnsyncedOOH(_writtenIds.oohRequests);
     if (_saveGen === _genAtStart) _savePending = false;
@@ -2235,6 +2290,8 @@ async function loadDB() {
       };
       if (rows[0].updated_at) _lastRemoteUpdatedAt = rows[0].updated_at;
       _lastSyncedIds = _snapshotSyncedIds(APP.db);
+      _lastSyncedFines = _snapshotSyncedFines(remote.clients);
+      _lastSyncedData = _snapshotSyncedData(remote);
       _restoreUnsyncedAppts();
       _restoreUnsyncedOOH(remote.oohRequests);
     } else {
@@ -5195,6 +5252,12 @@ function doConfirmBook() {
   if (isBlocked) {
     showToast('Este día ya no está disponible. La barbería está cerrada.', 'error');
     bookState.step = 1; renderBookStep(); return;
+  }
+  // FIX: la hora pudo bloquearse (blockedSlots) mientras el cliente estaba en la pantalla
+  // de confirmación — misma revalidación que la hora ocupada y el día bloqueado.
+  if (APP.db.blockedSlots && APP.db.blockedSlots.includes(bookState.date + '|' + bookState.time)) {
+    showToast('Esta hora ya no está disponible. Elige otra.', 'error');
+    bookState.step = 2; renderBookStep(); return;
   }
   const appt = {
     id: uid(),
@@ -8918,6 +8981,10 @@ function startRealTimeSync() {
               if (!lc.pendingFine && rc.pendingFine && !_intentionallyClearedFines.has(lc.id)) {
                 merged2.pendingFine = true;
                 merged2.fineAmount = rc.fineAmount;
+              } else if (_fineClearedRemotely(lc, rc)) {
+                // FIX: multa pagada/cancelada en otro dispositivo — no resucitarla desde local.
+                merged2.pendingFine = false;
+                merged2.fineAmount = rc.fineAmount || 0;
               } else {
                 merged2.pendingFine = !!(lc.pendingFine || rc.pendingFine) && lc.pendingFine && ((merged2.fineAmount || 0) > 0);
               }
@@ -8983,6 +9050,8 @@ function startRealTimeSync() {
           };
           _lastRemoteUpdatedAt = remoteTs || _lastRemoteUpdatedAt;
           _lastSyncedIds = _snapshotSyncedIds(APP.db);
+          _lastSyncedFines = _snapshotSyncedFines(remote.clients);
+          _lastSyncedData = _snapshotSyncedData(remote);
           // Si este móvil arrancó con la copia local y tenía una reserva sin subir, los datos
           // del servidor la acaban de quitar de la pantalla: volver a añadirla y subirla.
           _restoreUnsyncedAppts();
