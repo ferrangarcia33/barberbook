@@ -1763,8 +1763,15 @@ function _snapshotSyncedData(db) {
 // añadido a mano y el original que volvió desde la copia de otro dispositivo), y salían
 // duplicadas en el detalle de ganancias. Si una de las copias tiene importe y la otra no,
 // se conserva la que lo tiene.
-function _dedupeCutHistory(hist) {
+function _dedupeCutHistory(hist, extraRemoved) {
   if (!Array.isArray(hist)) return hist;
+  // FIX: cortes eliminados a propósito (APP.db.removedCutIds). La unión por apptId nunca
+  // resta, así que sin esta lista un corte borrado volvía desde cualquier otro dispositivo.
+  const _removed = new Set([
+    ...(Array.isArray(APP.db && APP.db.removedCutIds) ? APP.db.removedCutIds : []),
+    ...(Array.isArray(extraRemoved) ? extraRemoved : [])
+  ]);
+  if (_removed.size) hist = hist.filter(h => !(h && h.apptId && _removed.has(h.apptId)));
   // Copia preferida (igual en todos los dispositivos): 1) la de una cita que sigue en la
   // agenda (así los cambios de estado por apptId siguen encontrándola), 2) la que tiene
   // importe, 3) la de apptId menor. Si la elegida no tiene importe y la otra sí, se copia.
@@ -1984,7 +1991,7 @@ async function _pushDBToSupabase() {
               const localHist = Array.isArray(lc.cutHistory) ? lc.cutHistory : [];
               const localApptIds = new Set(localHist.map(h => h.apptId));
               const onlyRemoteHist = rc.cutHistory.filter(h => !localApptIds.has(h.apptId));
-              merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist]);
+              merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist], remoteData.removedCutIds);
             }
             // totalCuts: nunca retroceder — usar el mayor de los dos.
             if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
@@ -2009,6 +2016,10 @@ async function _pushDBToSupabase() {
             try { _localStr = JSON.stringify(APP.db[k]); } catch(e) { return; }
             if (_localStr === _lastSyncedData.get(k)) APP.db[k] = remoteData[k];
           });
+        }
+        // FIX: la lista de cortes eliminados solo crece: unir siempre local + remoto.
+        if (Array.isArray(remoteData.removedCutIds)) {
+          APP.db.removedCutIds = [...new Set([...(APP.db.removedCutIds || []), ...remoteData.removedCutIds])];
         }
       }
     } catch(e) {
@@ -2304,7 +2315,7 @@ async function loadDB() {
         schedule: remote.schedule ? Object.fromEntries(
           Object.entries(remote.schedule).map(([k,v]) => [parseInt(k), v])
         ) : APP.db.schedule,
-        clients: mergeClientsOnLoad(remote.clients, APP.db.clients).map(c => (c && Array.isArray(c.cutHistory)) ? { ...c, cutHistory: _dedupeCutHistory(c.cutHistory) } : c),
+        clients: mergeClientsOnLoad(remote.clients, APP.db.clients).map(c => (c && Array.isArray(c.cutHistory)) ? { ...c, cutHistory: _dedupeCutHistory(c.cutHistory, remote.removedCutIds) } : c),
         appointments: safeMergeArr(remote.appointments, APP.db.appointments),
         notifications: safeMergeArr(remote.notifications, APP.db.notifications),
         alerts: safeMergeArr(remote.alerts, APP.db.alerts),
@@ -9025,7 +9036,7 @@ function startRealTimeSync() {
                 const localHist = Array.isArray(lc.cutHistory) ? lc.cutHistory : [];
                 const localApptIds = new Set(localHist.map(h => h.apptId));
                 const onlyRemoteHist = rc.cutHistory.filter(h => !localApptIds.has(h.apptId));
-                merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist]);
+                merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist], remote.removedCutIds);
               }
               if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
                 merged2.totalCuts = rc.totalCuts;
