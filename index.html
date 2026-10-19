@@ -1758,6 +1758,34 @@ function _snapshotSyncedData(db) {
   }
   return m;
 }
+// FIX: quitar cortes repetidos del historial (mismo día, misma hora y mismo estado).
+// La unión por apptId conservaba entradas iguales con distinto apptId (p.ej. un corte
+// añadido a mano y el original que volvió desde la copia de otro dispositivo), y salían
+// duplicadas en el detalle de ganancias. Si una de las copias tiene importe y la otra no,
+// se conserva la que lo tiene.
+function _dedupeCutHistory(hist) {
+  if (!Array.isArray(hist)) return hist;
+  // Copia preferida (igual en todos los dispositivos): 1) la de una cita que sigue en la
+  // agenda (así los cambios de estado por apptId siguen encontrándola), 2) la que tiene
+  // importe, 3) la de apptId menor. Si la elegida no tiene importe y la otra sí, se copia.
+  const liveIds = new Set(((APP.db && APP.db.appointments) || []).map(a => a && a.id));
+  const score = h => (liveIds.has(h.apptId) ? 4 : 0) + (h.amountPaid != null ? 2 : 0);
+  const better = (a, b) => score(a) !== score(b) ? score(a) > score(b) : String(a.apptId) < String(b.apptId);
+  const byKey = new Map();
+  const out = [];
+  hist.forEach(h => {
+    if (!h || !h.date || !h.time) { out.push(h); return; }
+    const k = h.date + '|' + h.time + '|' + (h.status || '');
+    const idx = byKey.get(k);
+    if (idx === undefined) { byKey.set(k, out.length); out.push(h); return; }
+    const cur = out[idx];
+    let keep = better(h, cur) ? h : cur;
+    const other = keep === h ? cur : h;
+    if (keep.amountPaid == null && other.amountPaid != null) keep = { ...keep, amountPaid: other.amountPaid };
+    out[idx] = keep;
+  });
+  return out;
+}
 function _fineClearedRemotely(lc, rc) {
   if (!lc.pendingFine || rc.pendingFine || !_lastSyncedFines) return false;
   const base = _lastSyncedFines.get(lc.id);
@@ -1956,7 +1984,7 @@ async function _pushDBToSupabase() {
               const localHist = Array.isArray(lc.cutHistory) ? lc.cutHistory : [];
               const localApptIds = new Set(localHist.map(h => h.apptId));
               const onlyRemoteHist = rc.cutHistory.filter(h => !localApptIds.has(h.apptId));
-              merged2.cutHistory = [...localHist, ...onlyRemoteHist];
+              merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist]);
             }
             // totalCuts: nunca retroceder — usar el mayor de los dos.
             if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
@@ -2006,6 +2034,8 @@ async function _pushDBToSupabase() {
     const _clearedFinesWritten = new Set(_intentionallyClearedFines);
     const _unblockedDaysWritten = new Set(_intentionallyUnblockedDays);
     const _writtenIds = _snapshotSyncedIds(APP.db);
+    // FIX: lo que se sube nunca lleva cortes repetidos (también cuando no hubo fusión).
+    (APP.db.clients || []).forEach(c => { if (c && Array.isArray(c.cutHistory)) c.cutHistory = _dedupeCutHistory(c.cutHistory); });
     const _writtenFines = _snapshotSyncedFines(APP.db.clients);
     const _writtenData = _snapshotSyncedData(APP.db);
     if (_expectedRemoteTs) {
@@ -2256,7 +2286,7 @@ async function loadDB() {
             const localHist = Array.isArray(lc.cutHistory) ? lc.cutHistory : [];
             const localApptIds = new Set(localHist.map(h => h.apptId));
             const onlyRemoteHist = rc.cutHistory.filter(h => !localApptIds.has(h.apptId));
-            merged2.cutHistory = [...localHist, ...onlyRemoteHist];
+            merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist]);
           }
           if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
             merged2.totalCuts = rc.totalCuts;
@@ -2274,7 +2304,7 @@ async function loadDB() {
         schedule: remote.schedule ? Object.fromEntries(
           Object.entries(remote.schedule).map(([k,v]) => [parseInt(k), v])
         ) : APP.db.schedule,
-        clients: mergeClientsOnLoad(remote.clients, APP.db.clients),
+        clients: mergeClientsOnLoad(remote.clients, APP.db.clients).map(c => (c && Array.isArray(c.cutHistory)) ? { ...c, cutHistory: _dedupeCutHistory(c.cutHistory) } : c),
         appointments: safeMergeArr(remote.appointments, APP.db.appointments),
         notifications: safeMergeArr(remote.notifications, APP.db.notifications),
         alerts: safeMergeArr(remote.alerts, APP.db.alerts),
@@ -8995,7 +9025,7 @@ function startRealTimeSync() {
                 const localHist = Array.isArray(lc.cutHistory) ? lc.cutHistory : [];
                 const localApptIds = new Set(localHist.map(h => h.apptId));
                 const onlyRemoteHist = rc.cutHistory.filter(h => !localApptIds.has(h.apptId));
-                merged2.cutHistory = [...localHist, ...onlyRemoteHist];
+                merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist]);
               }
               if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
                 merged2.totalCuts = rc.totalCuts;
