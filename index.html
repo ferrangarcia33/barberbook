@@ -2949,6 +2949,8 @@ function acceptSwap(reqId) {
   if (APP._adminSession) { showToast('Modo vista — no puedes realizar esta acción', 'info'); return; }
   const req = (APP.db.swapRequests||[]).find(r => r.id === reqId);
   if (!req) return;
+  // Modal obsoleto: la solicitud pudo resolverse (p.ej. checkSwapAutoReject) mientras estaba abierto.
+  if (req.status !== 'pending') { showToast('Esta solicitud ya no está pendiente', 'info'); return; }
   // Swap the times
   const fromAppt = APP.db.appointments.find(a => a.id === req.fromApptId);
   const toAppt = APP.db.appointments.find(a => a.id === req.toApptId);
@@ -3023,6 +3025,7 @@ function rejectSwap(reqId) {
   if (APP._adminSession) { showToast('Modo vista — no puedes realizar esta acción', 'info'); return; }
   const req = (APP.db.swapRequests||[]).find(r => r.id === reqId);
   if (!req) return;
+  if (req.status !== 'pending') { showToast('Esta solicitud ya no está pendiente', 'info'); return; }
   req.status = 'rejected';
   // req.fromTime is stored when the swap request is created; fall back to 'tu hora original' if missing
   const origTime = req.fromTime || 'tu hora original';
@@ -8642,6 +8645,8 @@ function manualLateCheck(apptId) {
 function acceptOOH(id) {
   const req = APP.db.oohRequests.find(r => r.id === id);
   if (!req) return;
+  // Botón obsoleto: la solicitud pudo rechazarse automáticamente (checkOOHAutoReject) con la vista abierta.
+  if (req.status !== 'pending') { showToast('Esta solicitud ya no está pendiente', 'info'); navigate('admin'); return; }
   req.status = 'accepted';
   // Create appointment — use effective price for the appointment date
   const oohTotal = getEffectivePrice(req.date) + 5;
@@ -8659,6 +8664,7 @@ function acceptOOH(id) {
 function rejectOOH(id) {
   const req = APP.db.oohRequests.find(r => r.id === id);
   if (!req) return;
+  if (req.status !== 'pending') { showToast('Esta solicitud ya no está pendiente', 'info'); navigate('admin'); return; }
   req.status = 'rejected';
   addNotif(req.clientId, `❌ Tu solicitud fuera de horario para el ${formatDateHuman(req.date)} a las ${req.time} no ha podido ser aceptada.`);
   saveDB();
@@ -8843,6 +8849,8 @@ function manualNoShow(apptId) {
   // Apply penalty directly — do NOT re-open the late check overlay (that causes a loop)
   const appt = APP.db.appointments.find(a => a.id === apptId);
   if (!appt || appt.status === 'no-show') return;
+  // La cita pudo cancelarse (sync) mientras el modal de retraso estaba abierto: no multar una cita cancelada.
+  if (appt.status === 'cancelled') { showToast('Esta cita ya no está activa', 'info'); navigate('admin'); return; }
   const client = APP.db.clients.find(c => c.id === appt.clientId);
   if (client) {
     client.pendingFine = true;
