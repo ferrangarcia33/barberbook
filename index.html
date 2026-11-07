@@ -4187,7 +4187,7 @@ function renderCalendar() {
         style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none">
         <div style="font-size:0.7rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--text3);font-family:var(--font-mono)">💰 Dinero ganado este mes</div>
         <div style="display:flex;align-items:center;gap:10px">
-          <div style="font-family:var(--font-display);font-size:1.2rem;color:var(--green);font-weight:700">${earnedThisMonth}€</div>
+          <div style="font-family:var(--font-display);font-size:1.2rem;color:var(--green);font-weight:700">${_fmtTipEuro(earnedThisMonth)}€</div>
           <span id="${_breakdownId}_arr" style="color:var(--text3);font-size:0.8rem;transition:transform 0.2s;display:inline-block">▼</span>
         </div>
       </div>
@@ -4206,7 +4206,7 @@ function renderCalendar() {
         </div>
         <div onclick="showEarningsDetail('tips')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;cursor:pointer">
           <div style="font-size:0.82rem;color:var(--green)">🎁 Propinas <span style="color:var(--green);opacity:0.7;font-family:'Courier New',monospace;font-size:0.75rem">(${tipsThisMonth.length})</span></div>
-          <div style="display:flex;align-items:center;gap:6px"><div style="font-family:'Courier New',monospace;font-size:0.9rem;font-weight:700;color:var(--green)">${tipsTotals}€</div><span style="color:var(--green);opacity:0.7;font-size:0.75rem">›</span></div>
+          <div style="display:flex;align-items:center;gap:6px"><div style="font-family:'Courier New',monospace;font-size:0.9rem;font-weight:700;color:var(--green)">${_fmtTipEuro(tipsTotals)}€</div><span style="color:var(--green);opacity:0.7;font-size:0.75rem">›</span></div>
         </div>
       </div>
     </div>`;
@@ -7656,7 +7656,7 @@ function openRegisterTipModal(preserve) {
     </div>
     <div style="margin-bottom:12px">
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:4px;font-family:var(--font-mono);letter-spacing:0.05em">IMPORTE (€)</div>
-      <input id="regTipAmount" type="number" class="input" value="${state.amount}" min="1" max="500" inputmode="numeric" style="width:100%;box-sizing:border-box">
+      <input id="regTipAmount" type="text" class="input" value="${_fmtTipEuro(state.amount)}" inputmode="decimal" autocomplete="off" style="width:100%;box-sizing:border-box">
     </div>
     <div style="margin-bottom:16px">
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:4px;font-family:var(--font-mono);letter-spacing:0.05em">FECHA</div>
@@ -7669,8 +7669,20 @@ function openRegisterTipModal(preserve) {
   `);
 }
 
+// Propinas con céntimos: acepta "5", "5,5", "5,50" o "5.50" (máx. 2 decimales).
+function _parseTipAmount(v) {
+  const t = String(v == null ? '' : v).trim().replace(',', '.');
+  if (!/^\d+(\.\d{0,2})?$/.test(t)) return NaN;
+  return Math.round(parseFloat(t) * 100) / 100;
+}
+// Muestra importes: enteros igual que antes ("5"), con céntimos en formato español ("5,50").
+function _fmtTipEuro(n) {
+  const r = Math.round((Number(n) || 0) * 100) / 100;
+  return Number.isInteger(r) ? String(r) : r.toFixed(2).replace('.', ',');
+}
+
 function _saveRegTipState() {
-  const amt = parseInt(document.getElementById('regTipAmount').value, 10);
+  const amt = _parseTipAmount(document.getElementById('regTipAmount').value);
   const dt = document.getElementById('regTipDate').value;
   APP._regTipState = {
     amount: (amt && amt > 0) ? amt : 5,
@@ -7715,7 +7727,7 @@ function _selectClientForTip(clientId) {
 }
 
 function _confirmRegisterTip() {
-  var amt = parseInt(document.getElementById('regTipAmount').value, 10);
+  var amt = _parseTipAmount(document.getElementById('regTipAmount').value);
   var dt = document.getElementById('regTipDate').value;
   var clientId = (APP._regTipState && APP._regTipState.clientId) || '';
   if (!amt || amt < 1) { showToast('Introduce un importe válido', 'error'); return; }
@@ -7726,7 +7738,7 @@ function _confirmRegisterTip() {
   openModal('✅ Confirmar propina', `
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2.5rem;margin-bottom:10px">🎁</div>
-      <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:6px">¿Confirmar propina de ${amt}€?</div>
+      <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:6px">¿Confirmar propina de ${_fmtTipEuro(amt)}€?</div>
       ${clName ? `<div style="font-size:0.82rem;color:var(--text3);margin-bottom:4px">Cliente: ${escHtml(clName)}</div>` : ''}
       <div style="font-size:0.82rem;color:var(--text3);margin-bottom:4px">Fecha: ${dtFmt}</div>
       <div style="font-size:0.82rem;color:var(--text3)">Se sumará al dinero ganado ese mes.</div>
@@ -7747,7 +7759,7 @@ function _doRegisterTip(dt, amt, clientId) {
   APP.db.tipsStandalone.push(entry);
   APP._regTipState = null;
   saveDB();
-  showToast('Propina de ' + amt + '€ registrada ✓', 'success');
+  showToast('Propina de ' + _fmtTipEuro(amt) + '€ registrada ✓', 'success');
   navigate('profile');
 }
 
@@ -9884,7 +9896,7 @@ function showEarningsDetail(type) {
           <div style="font-size:0.88rem;font-weight:600;color:var(--text)">${escHtml(t.clientName || 'Sin cliente especificado')}</div>
           <div style="font-size:0.75rem;color:var(--text3)">${t.date ? formatDateHuman(t.date) : ''}</div>
         </div>
-        <div style="font-family:'Courier New',monospace;font-size:0.9rem;font-weight:700;color:var(--green)">${t.amount || 0}€</div>
+        <div style="font-family:'Courier New',monospace;font-size:0.9rem;font-weight:700;color:var(--green)">${_fmtTipEuro(t.amount || 0)}€</div>
       </div>`;
     });
     body += '</div>';
