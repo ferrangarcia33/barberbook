@@ -1218,8 +1218,8 @@ window.addEventListener('beforeinstallprompt', e => {
   </div>
   <div class="login-box">
     <div class="login-tabs">
-      <div class="login-tab active" onclick="switchLoginTab('client')" id="tab-client">Soy Cliente</div>
-      <div class="login-tab" onclick="switchLoginTab('admin')" id="tab-admin">Acceso Barbero ✂️</div>
+      <div class="login-tab active" onclick="switchLoginTab('client')" id="tab-client" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">Soy Cliente</div>
+      <div class="login-tab" onclick="switchLoginTab('admin')" id="tab-admin" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">Acceso Barbero ✂️</div>
     </div>
     <!-- Client Login -->
     <div id="login-client">
@@ -1298,11 +1298,11 @@ window.addEventListener('beforeinstallprompt', e => {
       <a href="https://www.tiktok.com/@ferriiib?is_from_webapp=1&sender_device=pc" target="_blank" rel="noopener" class="icon-btn social-btn" title="TikTok" style="text-decoration:none">
         <svg width="16" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.69a8.26 8.26 0 0 0 4.83 1.55V6.79a4.85 4.85 0 0 1-1.06-.1z"/></svg>
       </a>
-      <div class="icon-btn" onclick="showNotifications()" id="notifBtn">
+      <div class="icon-btn" onclick="showNotifications()" id="notifBtn" aria-label="Notificaciones" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
         🔔
         <div class="badge" id="notifBadge" style="display:none">0</div>
       </div>
-      <div class="icon-btn" onclick="logout()">⏏️</div>
+      <div class="icon-btn" onclick="logout()" aria-label="Cerrar sesión" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">⏏️</div>
     </div>
   </div>
 
@@ -1313,23 +1313,23 @@ window.addEventListener('beforeinstallprompt', e => {
 
   <!-- BOTTOM NAV -->
   <nav class="bottom-nav" id="bottomNav" aria-label="Navegación principal">
-    <div class="nav-item active" onclick="navigate('home')" id="nav-home">
+    <div class="nav-item active" onclick="navigate('home')" id="nav-home" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9,22 9,12 15,12 15,22"/></svg>
       Inicio
     </div>
-    <div class="nav-item" onclick="navigate('book')" id="nav-book">
+    <div class="nav-item" onclick="navigate('book')" id="nav-book" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
       <span id="navBookLabel">Reservar</span>
     </div>
-    <div class="nav-item" onclick="navigate('appointments')" id="nav-appointments">
+    <div class="nav-item" onclick="navigate('appointments')" id="nav-appointments" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/></svg>
       Citas
     </div>
-    <div class="nav-item" onclick="navigate('profile')" id="nav-profile">
+    <div class="nav-item" onclick="navigate('profile')" id="nav-profile" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
       Perfil
     </div>
-    <div class="nav-item" onclick="navigate('admin')" id="nav-admin" style="display:none">
+    <div class="nav-item" onclick="navigate('admin')" id="nav-admin" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" style="display:none">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"/></svg>
       Admin
     </div>
@@ -2560,8 +2560,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // retrasos. Antes el loop arrancaba primero y, si la cita ya tenía >=15 min, la marcaba
   // 'done' al instante; 4s después _processPendingPushAnswers() veía 'done' y descartaba
   // la respuesta "No llegó" que el admin había dado desde la notificación.
-  _processPendingPushAnswers().finally(startLateCheckLoop);
-  startReminderLoop();
+  // FIX: checkDailyReset() (dentro de startReminderLoop) elimina las citas de días anteriores;
+  // si se ejecutaba antes de que _processPendingPushAnswers() terminase, borraba la cita
+  // pendiente de ayer y la respuesta "No llegó"/"Sí, llegó" dada desde la notificación se perdía.
+  _processPendingPushAnswers().finally(() => { startLateCheckLoop(); startReminderLoop(); });
   startRealTimeSync();
   // Refrescar admin_sub en late_checks_pending por si la suscripción push se renovó
   // (garantiza que la push llega aunque el móvil esté apagado, igual que los recordatorios 24h)
@@ -7730,7 +7732,9 @@ function _confirmRegisterTip() {
   var amt = _parseTipAmount(document.getElementById('regTipAmount').value);
   var dt = document.getElementById('regTipDate').value;
   var clientId = (APP._regTipState && APP._regTipState.clientId) || '';
-  if (!amt || amt < 1) { showToast('Introduce un importe válido', 'error'); return; }
+  // FIX: la propina admite céntimos (_parseTipAmount), así que el mínimo es > 0 y no 1 €:
+  // con "amt < 1" una propina de 0,25 € se rechazaba como importe no válido.
+  if (!(amt > 0)) { showToast('Introduce un importe válido', 'error'); return; }
   if (!dt) { showToast('Introduce una fecha', 'error'); return; }
   var dtFmt = dt.split('-').reverse().join('/');
   var cl = clientId ? APP.db.clients.find(c => c.id === clientId) : null;
