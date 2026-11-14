@@ -1750,6 +1750,26 @@ function _snapshotSyncedFines(clients) {
 // no ha cambiado localmente desde la última sincronización, se toma el valor remoto.
 // null = sin base fiable (p.ej. arranque desde copia local) → comportamiento anterior.
 let _lastSyncedData = null;
+// FIX: guardar en IndexedDB la base de la última sincronización (_lastSyncedFines y
+// _lastSyncedData). Si la app arranca desde la copia local (servidor lento o sin red),
+// antes esa base quedaba a null: el merge no podía saber que una multa se había pagado
+// en otro dispositivo (la volvía a poner pendiente) y las claves sin merge propio
+// (p.ej. finesPaidStandalone) se subían con el valor local antiguo, borrando cobros.
+function _persistSyncBase() {
+  try {
+    if (!_lastSyncedFines || !_lastSyncedData) return;
+    _idbSet('barberbook_sync_base', JSON.stringify({ fines: [..._lastSyncedFines], data: [..._lastSyncedData] })).catch(() => {});
+  } catch(e) {}
+}
+async function _restoreSyncBase() {
+  try {
+    const raw = await _idbGet('barberbook_sync_base');
+    if (!raw) return;
+    const p = JSON.parse(raw);
+    if (Array.isArray(p.fines)) _lastSyncedFines = new Map(p.fines);
+    if (Array.isArray(p.data)) _lastSyncedData = new Map(p.data);
+  } catch(e) {}
+}
 const _SPECIAL_MERGE_KEYS = new Set(['appointments','notifications','oohRequests','swapRequests','pushSubscriptions','blockedDays','clients']);
 function _snapshotSyncedData(db) {
   const m = new Map();
@@ -2088,6 +2108,7 @@ async function _pushDBToSupabase() {
     _lastSyncedIds = _writtenIds;
     _lastSyncedFines = _writtenFines;
     _lastSyncedData = _writtenData;
+    _persistSyncBase();
     _clearSyncedUnsyncedAppts(_writtenIds.appointments);
     _clearSyncedUnsyncedOOH(_writtenIds.oohRequests);
     if (_saveGen === _genAtStart) _savePending = false;
@@ -2333,6 +2354,7 @@ async function loadDB() {
       _lastSyncedIds = _snapshotSyncedIds(APP.db);
       _lastSyncedFines = _snapshotSyncedFines(remote.clients);
       _lastSyncedData = _snapshotSyncedData(remote);
+      _persistSyncBase();
       _restoreUnsyncedAppts();
       _restoreUnsyncedOOH(remote.oohRequests);
     } else {
@@ -2387,6 +2409,7 @@ async function _tryLoadLocalBackup() {
       if (parsed && (parsed.adminPin || (Array.isArray(parsed.clients) && parsed.clients.length > 0))) {
         console.warn('Supabase unavailable — loaded from localStorage backup');
         _safeApplyBackup(parsed);
+        await _restoreSyncBase();
         // Mark _lastRemoteUpdatedAt as null so the first successful sync always applies
         // remote data (instead of being skipped as "not newer than last push").
         _lastRemoteUpdatedAt = null;
@@ -2405,6 +2428,7 @@ async function _tryLoadLocalBackup() {
       if (parsed && (parsed.adminPin || (Array.isArray(parsed.clients) && parsed.clients.length > 0))) {
         console.warn('Supabase unavailable — loaded from IndexedDB backup');
         _safeApplyBackup(parsed);
+        await _restoreSyncBase();
         _lastRemoteUpdatedAt = null; // allow next successful sync to apply fresh remote data
         // Restore to localStorage so subsequent access is fast
         try { localStorage.setItem('barberbook_db_backup', raw); } catch(e) {}
@@ -9117,6 +9141,7 @@ function startRealTimeSync() {
           _lastSyncedIds = _snapshotSyncedIds(APP.db);
           _lastSyncedFines = _snapshotSyncedFines(remote.clients);
           _lastSyncedData = _snapshotSyncedData(remote);
+          _persistSyncBase();
           // Si este móvil arrancó con la copia local y tenía una reserva sin subir, los datos
           // del servidor la acaban de quitar de la pantalla: volver a añadirla y subirla.
           _restoreUnsyncedAppts();
