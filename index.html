@@ -1118,7 +1118,7 @@ window.addEventListener('beforeinstallprompt', e => {
 
 <!-- LATE CHECK OVERLAY -->
 <div class="late-check-overlay" id="lateCheckOverlay">
-  <div class="late-check-card">
+  <div class="late-check-card" role="alertdialog" aria-modal="true" aria-labelledby="lateCheckTitle" aria-describedby="lateCheckSub">
     <div class="pulse-ring">⏰</div>
     <div class="late-check-title" id="lateCheckTitle">¿Ha llegado el cliente?</div>
     <div class="late-check-sub" id="lateCheckSub">Han pasado 10 minutos de la cita. ¿Tu cliente ya está aquí?</div>
@@ -1131,7 +1131,7 @@ window.addEventListener('beforeinstallprompt', e => {
 
 <!-- MODAL -->
 <div class="modal-overlay" id="modal" onclick="closeModal(event)">
-  <div class="modal-sheet" id="modalSheet">
+  <div class="modal-sheet" id="modalSheet" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
     <div class="modal-handle" id="modalHandle"></div>
     <div class="modal-title" id="modalTitle"></div>
     <div class="modal-body" id="modalBody"></div>
@@ -1550,6 +1550,12 @@ const _intentionallyUnblockedDays = new Set();
 // en _pushDBToSupabase() las volvía a añadir desde el snapshot remoto y el borrado nunca
 // llegaba a persistirse. Se vacía tras una escritura correcta que ya no las contiene.
 const _intentionallyRemovedPushSubs = new Set();
+// FIX: true mientras resetAllData() borra todo. Impide que saveDB()/_pushDBToSupabase() y
+// los volcados de beforeunload/pagehide/visibilitychange/backup periódico vuelvan a escribir
+// la base en memoria (aún completa) y deshagan el borrado al recargar.
+let _resetInProgress = false;
+// Fila remota existente pero vacía (data = {}), estado que deja resetAllData().
+let _remoteDBEmpty = false;
 let _savePending = false; // true while a save is debounced or in-flight — block sync during this window
 let _saveRetryCount = 0;  // number of consecutive failed Supabase saves
 const _SAVE_MAX_RETRIES = 5; // stop retrying after this many failures
@@ -1820,6 +1826,33 @@ function _dedupeCutHistory(hist, extraRemoved) {
   });
   return out;
 }
+// FIX: unión de cutHistory por apptId. Antes, si la entrada existía en ambos lados, ganaba
+// SIEMPRE la local: una corrección del barbero (p.ej. "realizada" → "no se presentó") nunca
+// llegaba a los demás dispositivos y, en cuanto uno de ellos guardaba, la revertía en Supabase.
+// Ahora, si la entrada local no ha cambiado desde la última sincronización (_lastSyncedData),
+// se toma la remota. Sin base fiable (null) se mantiene el comportamiento anterior.
+function _cutHistBaseMap() {
+  const m = new Map();
+  try {
+    const raw = _lastSyncedData && _lastSyncedData.get('clients');
+    const arr = raw ? JSON.parse(raw) : null;
+    (Array.isArray(arr) ? arr : []).forEach(c => {
+      if (!c || !c.id || !Array.isArray(c.cutHistory)) return;
+      c.cutHistory.forEach(h => { if (h && h.apptId) m.set(c.id + '|' + h.apptId, JSON.stringify(h)); });
+    });
+  } catch(e) {}
+  return m;
+}
+function _mergeCutHistory(clientId, localHist, remoteHist, baseMap) {
+  const remoteById = new Map(remoteHist.filter(h => h && h.apptId).map(h => [h.apptId, h]));
+  const localApptIds = new Set(localHist.map(h => h && h.apptId));
+  const keptLocal = localHist.map(h => {
+    const r = (h && h.apptId) ? remoteById.get(h.apptId) : null;
+    if (r && baseMap && baseMap.get(clientId + '|' + h.apptId) === JSON.stringify(h)) return r;
+    return h;
+  });
+  return [...keptLocal, ...remoteHist.filter(h => !localApptIds.has(h && h.apptId))];
+}
 function _fineClearedRemotely(lc, rc) {
   if (!lc.pendingFine || rc.pendingFine || !_lastSyncedFines) return false;
   const base = _lastSyncedFines.get(lc.id);
@@ -1827,6 +1860,7 @@ function _fineClearedRemotely(lc, rc) {
 }
 
 function saveDB() {
+  if (_resetInProgress) return;
   // Show syncing indicator
   const dot = document.getElementById('syncDot');
   if (dot) dot.style.background = 'var(--gold)';
@@ -1857,6 +1891,7 @@ function saveDB() {
 }
 
 async function _pushDBToSupabase() {
+  if (_resetInProgress) return;
   const dot = document.getElementById('syncDot');
   const _genAtStart = _saveGen;
   try {
@@ -1998,7 +2033,11 @@ async function _pushDBToSupabase() {
         if (Array.isArray(remoteData.clients)) {
           const localClients = APP.db.clients || [];
           const remoteClientsById = new Map(remoteData.clients.map(c => [c.id, c]));
-          APP.db.clients = localClients.map(lc => {
+          const _histBase = _cutHistBaseMap();
+          // FIX: un cliente que estaba en la última base sincronizada y ya no está en remoto
+          // fue eliminado en otro dispositivo — no volver a subirlo. Los creados aquí y aún
+          // sin subir no están en _lastSyncedIds y se conservan.
+          APP.db.clients = localClients.filter(lc => remoteClientsById.has(lc.id) || !_wasSyncedAndRemoved('clients', lc.id)).map(lc => {
             const rc = remoteClientsById.get(lc.id);
             if (!rc) return lc;
             const merged2 = { ...lc };
@@ -2027,9 +2066,7 @@ async function _pushDBToSupabase() {
             // Historial de cortes: unión por apptId (sin duplicados), conservando ambos lados.
             if (Array.isArray(rc.cutHistory)) {
               const localHist = Array.isArray(lc.cutHistory) ? lc.cutHistory : [];
-              const localApptIds = new Set(localHist.map(h => h.apptId));
-              const onlyRemoteHist = rc.cutHistory.filter(h => !localApptIds.has(h.apptId));
-              merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist], remoteData.removedCutIds);
+              merged2.cutHistory = _dedupeCutHistory(_mergeCutHistory(lc.id, localHist, rc.cutHistory, _histBase), remoteData.removedCutIds);
             }
             // totalCuts: nunca retroceder — usar el mayor de los dos.
             if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
@@ -2228,7 +2265,7 @@ async function _idbDelete(key) {
 }
 
 function saveSession() {
-  if (!APP.currentUser) return;
+  if (_resetInProgress || !APP.currentUser) return;
   // Don't save session while admin is viewing as client — admin session must stay in storage
   if (APP._adminSession) return;
   // Sessions never expire — only cleared on manual logout or if the client account is deleted
@@ -2309,6 +2346,9 @@ async function loadDB() {
   try { _hadUnsynced = localStorage.getItem('barberbook_unsynced') === '1'; } catch(e) {}
   if (_hadUnsynced && await _tryLoadLocalBackup()) {
     saveDB();
+    // FIX: este return se saltaba la restauración de sesión del final de loadDB() y el
+    // usuario aparecía en la pantalla de login aunque su sesión seguía guardada.
+    if (!APP.currentUser) await loadSession();
     return;
   }
   try {
@@ -2406,6 +2446,7 @@ async function loadDB() {
         pushSubscriptions: remote.pushSubscriptions || APP.db.pushSubscriptions || {},
       };
       if (rows[0].updated_at) _lastRemoteUpdatedAt = rows[0].updated_at;
+      if (!remote.adminPin) _remoteDBEmpty = true; // servidor accesible pero sin barbero configurado
       _lastSyncedIds = _snapshotSyncedIds(APP.db);
       _lastSyncedFines = _snapshotSyncedFines(remote.clients);
       _lastSyncedData = _snapshotSyncedData(remote);
@@ -2413,6 +2454,10 @@ async function loadDB() {
       _restoreUnsyncedAppts();
       _restoreUnsyncedOOH(remote.oohRequests);
     } else {
+      // FIX: el servidor SÍ respondió con la fila vacía (data = {}), estado que deja
+      // resetAllData(). Se anota para ir a la pantalla de configuración en vez de
+      // mostrar "Sin conexión" (que se quedaba para siempre, aunque sí hay conexión).
+      if (rows && rows.length > 0 && rows[0].data && typeof rows[0].data === 'object' && Object.keys(rows[0].data).length === 0) _remoteDBEmpty = true;
       // Supabase returned nothing — try localStorage/IndexedDB backup before giving up
       await _tryLoadLocalBackup();
     }
@@ -2500,6 +2545,7 @@ async function _tryLoadLocalBackup() {
 // INIT
 // =============================================
 window.addEventListener('beforeunload', () => {
+  if (_resetInProgress) return;
   // Always flush to localStorage on close — this is synchronous and guaranteed.
   // The async Supabase push is best-effort (browser may kill it before completion).
   try {
@@ -2539,6 +2585,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   } catch(e) {}
   await loadDB();
+  // FIX: la vista "Ver perfil" nunca guarda la sesión del cliente (saveSession() la omite),
+  // así que tras recargar loadSession() siempre restaura la sesión del admin. Si se deja
+  // _adminSession puesto, el admin queda en "Modo vista" (no puede cancelar citas, bloquear
+  // horas ni activar push) y "Cerrar sesión" no cierra la sesión.
+  if (APP._adminSession && APP.isAdmin) {
+    APP._adminSession = null;
+    try { sessionStorage.removeItem('_barberbook_adminSession'); } catch(e) {}
+  }
 
   // Clean up any expired temporary price period (side-effect separated from getEffectivePrice)
   _cleanupExpiredTempPrice();
@@ -2604,7 +2658,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       let _backupHasData = false;
       try { const _p = _rawBackup ? JSON.parse(_rawBackup) : null; _backupHasData = !!(_p && _p.adminPin); } catch(e) {}
       const _noBackup = !_backupHasData;
-      if (_noBackup) {
+      if (_noBackup && !_remoteDBEmpty) {
         // No hay datos en ningún lado — casi seguro es la primera vez sin conexión
         const loadEl = document.getElementById('screen-loading');
         if (loadEl) {
@@ -2685,6 +2739,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // --- EXTRA DATA SAFETY: flush on visibility hidden (iOS Safari kills beforeunload) ---
   document.addEventListener('visibilitychange', () => {
+    if (_resetInProgress) return;
     if (document.visibilityState === 'hidden' && APP.db.adminPin) {
       try {
         const json = JSON.stringify(APP.db);
@@ -2720,7 +2775,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // pagehide fires on iOS Safari when user navigates away or closes
   window.addEventListener('pagehide', () => {
-    if (!APP.db.adminPin) return;
+    if (_resetInProgress || !APP.db.adminPin) return;
     try {
       const json = JSON.stringify(APP.db);
       localStorage.setItem('barberbook_db_backup', json);
@@ -2870,7 +2925,9 @@ function showApp() {
     // Skip normas check for viewer — they don't need to acknowledge rules
     const _hasNormas = Array.isArray(APP.db.normas) && APP.db.normas.length > 0;
     const _needsAck = (APP.db.normasVersion && APP.currentUser.normasAckVersion !== APP.db.normasVersion);
-    if (APP.currentUser.id !== '_viewer' && _needsAck) {
+    // FIX: no mostrar la pantalla de normas en "Ver perfil" (admin viendo como cliente):
+    // ackNormas() está bloqueado en modo vista y esa pantalla no tiene botón para volver.
+    if (APP.currentUser.id !== '_viewer' && !APP._adminSession && _needsAck) {
       renderNormasAckScreen();
       showScreen('screen-normas-ack');
       return;
@@ -3079,10 +3136,10 @@ function acceptSwap(reqId) {
   // baked into fire_at — without this, the server-side automatic push (10 min after
   // the appt) fires at the pre-swap time instead of the new one. Cancel the stale rows
   // and reschedule with the now-correct .time for both appointments.
-  _cancelLateCheckPush(fromAppt.id);
-  _cancelLateCheckPush(toAppt.id);
-  _scheduleLateCheckPush(fromAppt);
-  _scheduleLateCheckPush(toAppt);
+  // El DELETE debe terminar antes del nuevo upsert: lanzados en paralelo, el servidor
+  // podía procesar el DELETE después y borrar la fila recién programada.
+  _cancelLateCheckPush(fromAppt.id).then(() => _scheduleLateCheckPush(fromAppt));
+  _cancelLateCheckPush(toAppt.id).then(() => _scheduleLateCheckPush(toAppt));
   // Igual para el recordatorio 24h: su fila guarda fire_at y el texto con la hora antigua.
   // Es un upsert por id (merge-duplicates), así que sobrescribe la fila existente.
   _scheduleReminderPush(fromAppt);
@@ -3244,9 +3301,9 @@ function editNorma(id) {
   const n = (APP.db.normas||[]).find(x => x.id === id);
   if (!n) return;
   openModal('✏️ Editar norma', `
-    <input type="text" id="editNormaIcon" class="input" value="${escHtml(n.icon)}" style="width:60px;text-align:center;font-size:1.2rem;margin-bottom:8px"
+    <input type="text" id="editNormaIcon" aria-label="Icono de la norma" class="input" value="${escHtml(n.icon)}" style="width:60px;text-align:center;font-size:1.2rem;margin-bottom:8px"
       onfocus="this.scrollIntoView({block:'center',behavior:'smooth'})">
-    <textarea id="editNormaText" class="input" rows="3" style="width:100%;resize:vertical;font-family:inherit;margin-bottom:8px"
+    <textarea id="editNormaText" aria-label="Texto de la norma" class="input" rows="3" style="width:100%;resize:vertical;font-family:inherit;margin-bottom:8px"
       onfocus="this.scrollIntoView({block:'center',behavior:'smooth'})">${escHtml(n.text)}</textarea>
     <button type="button" class="btn btn-ghost btn-sm" style="width:auto;padding:4px 14px;font-weight:700;margin-bottom:10px" onclick="wrapBoldInTextarea('editNormaText')">B · Negrita</button>
     <div style="display:flex;gap:10px">
@@ -3280,7 +3337,7 @@ function confirmDeleteNorma(id) {
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2rem;margin-bottom:10px">🗑</div>
       <div style="font-size:0.9rem;font-weight:600;margin-bottom:8px">¿Eliminar esta norma?</div>
-      <div style="background:var(--bg3);border-radius:8px;padding:10px;font-size:0.82rem;color:var(--text2)">${n.icon} ${escHtml(n.text.replace(/<[^>]*>/g,''))}</div>
+      <div style="background:var(--bg3);border-radius:8px;padding:10px;font-size:0.82rem;color:var(--text2)">${escHtml(n.icon)} ${escHtml(n.text.replace(/<[^>]*>/g,''))}</div>
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
@@ -3373,7 +3430,7 @@ function clientAddToCalendar(apptId) {
   openModal('📅 Añadir al calendario', `
     <div style="display:flex;flex-direction:column;gap:10px;padding-bottom:8px">
       <button class="btn btn-ghost" style="border-color:var(--text2);color:var(--text);justify-content:flex-start;gap:12px;padding:14px 16px"
-        onclick="closeModal();(function(){var ap=APP.db.appointments.find(function(x){return x.id==='${apptId}'});if(ap){try{var _ca=JSON.parse(localStorage.getItem('barberbook_calAdded')||'[]');if(!_ca.includes(ap.id)){_ca.push(ap.id);localStorage.setItem('barberbook_calAdded',JSON.stringify(_ca));}renderBookStep();}catch(e){}downloadICS(ap);}})()">
+        onclick="closeModal();(function(){var ap=APP.db.appointments.find(function(x){return x.id==='${apptId}'});if(ap){try{var _ca=JSON.parse(localStorage.getItem('barberbook_calAdded')||'[]');if(!_ca.includes(ap.id)){_ca.push(ap.id);localStorage.setItem('barberbook_calAdded',JSON.stringify(_ca));}if(APP.currentPage==='appointments')navigate('appointments');}catch(e){}downloadICS(ap);}})()">
         <span style="font-size:1.3rem">📱</span>
         <div style="font-weight:600;font-size:0.9rem">Calendario iPhone</div>
       </button>
@@ -3528,6 +3585,9 @@ function confirmResetAll2() {
 }
 
 async function resetAllData() {
+  _resetInProgress = true;
+  if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+  if (_retryTimer) { clearTimeout(_retryTimer); _retryTimer = null; }
   // Only remove BarberBook keys — don't nuke other apps sharing the same origin
   // FIX: borrar también la marca de cambios sin subir y la base de sincronización; si no,
   // al recargar loadDB() volvería a subir la copia antigua y desharía el borrado.
@@ -3779,10 +3839,16 @@ async function registerClient() {
 function _syncClientBlockNav() {
   // Hides the "Inicio" and "Reservar/Calendario" nav items for blocked clients.
   // Does not apply to admin or viewer sessions.
-  if (APP.isAdmin || APP.isViewer) return;
-  const blocked = !!(APP.currentUser && APP.currentUser.blocked);
   const navHome = document.getElementById('nav-home');
   const navBook = document.getElementById('nav-book');
+  // FIX: en admin/viewer, restaurar las pestañas que pudo ocultar una sesión anterior de
+  // cliente bloqueado (p.ej. "Ver perfil" de un cliente bloqueado → "Volver a admin").
+  if (APP.isAdmin || APP.isViewer) {
+    if (navHome) navHome.style.display = '';
+    if (navBook) navBook.style.display = '';
+    return;
+  }
+  const blocked = !!(APP.currentUser && APP.currentUser.blocked);
   if (navHome) navHome.style.display = blocked ? 'none' : '';
   if (navBook) navBook.style.display = blocked ? 'none' : '';
 }
@@ -4528,7 +4594,7 @@ function renderAdminAgenda() {
       ${_viewerMode ? '' : `<button class="btn btn-ghost" style="margin-top:10px;border-color:var(--text3);color:var(--text3);width:auto;padding:6px 14px;font-size:0.8rem" onclick="unblockDay('${dateStr}')">Desbloquear día</button>`}
     </div>`;
   } else {
-    if (!_viewerMode && dateStr >= todayD) html += `<div style="margin-top:40px;border-top:1px solid var(--border);padding-top:12px"><button class="btn btn-ghost" style="border-color:var(--red);color:var(--red)" onclick="cancelFullDay('${dateStr}')">🚫 Cancelar todas las citas de hoy</button></div>`;
+    if (!_viewerMode && dateStr >= todayD) html += `<div style="margin-top:40px;border-top:1px solid var(--border);padding-top:12px"><button class="btn btn-ghost" style="border-color:var(--red);color:var(--red)" onclick="cancelFullDay('${dateStr}')">🚫 Cancelar todas las citas de este día</button></div>`;
   }
   return html;
 }
@@ -4971,7 +5037,28 @@ function carouselNav(dir) {
   if (next) next.style.display = 'block';
   const nextDot = document.getElementById('dot_' + idx);
   if (nextDot) nextDot.style.background = 'var(--gold)';
-  // Countdown timers in the new slide self-start via setTimeout(100ms) in buildApptCard.
+  // FIX: el setTimeout(100ms) de buildApptCard solo se ejecuta una vez al pintar la página, y
+  // _clearCountdownTicks() de arriba acaba de parar todos los contadores: sin esto, la tarjeta
+  // mostrada quedaba con la cuenta atrás congelada. Se restaura su id y se vuelve a arrancar.
+  if (next) next.querySelectorAll('[id^="appt_timer_"]').forEach(el => {
+    el.id = el.id.replace(/(_old)+$/, '');
+    const _ap = APP.db.appointments.find(a => 'appt_timer_' + a.id === el.id);
+    if (!_ap) return;
+    const [_y, _mo, _d] = _ap.date.split('-').map(Number);
+    const [_h, _mi] = _ap.time.split(':').map(Number);
+    const adt = new Date(_y, _mo - 1, _d, _h, _mi, 0);
+    const tid = el.id;
+    const tick = setInterval(() => {
+      const e2 = document.getElementById(tid);
+      if (!e2) { clearInterval(tick); _countdownTicks = _countdownTicks.filter(t => t !== tick); return; }
+      const left = adt - Date.now();
+      if (left <= 0) { e2.textContent = '⏳ ¡Ahora!'; clearInterval(tick); _countdownTicks = _countdownTicks.filter(t => t !== tick); return; }
+      const ts = Math.floor(left / 1000);
+      const td = Math.floor(ts/86400), th = Math.floor((ts%86400)/3600), tmm = Math.floor((ts%3600)/60), tss = ts%60;
+      e2.innerHTML = '⏳ ' + (td > 0 ? td+'d '+String(th).padStart(2,'0')+'h '+String(tmm).padStart(2,'0')+'m' : th > 0 ? String(th).padStart(2,'0')+'h '+String(tmm).padStart(2,'0')+'m '+String(tss).padStart(2,'0')+'s' : String(tmm).padStart(2,'0')+'m '+String(tss).padStart(2,'0')+'s');
+    }, 1000);
+    _countdownTicks.push(tick);
+  });
 }
 
 function adminNavDay(dir) {
@@ -5047,12 +5134,12 @@ function renderTimeSlots() {
   const nextDate = getAdjacentDate(bookState.date, 1);
 
   let html = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:8px">
-    <button class="cal-nav-btn" style="width:40px;height:40px;flex-shrink:0;font-size:1.1rem" onclick="${prevDate ? `selectDate('${prevDate}')` : ''}" ${!prevDate ? 'disabled style="opacity:0.3;cursor:not-allowed;width:40px;height:40px;flex-shrink:0"' : ''}>‹</button>
+    <button class="cal-nav-btn" style="width:40px;height:40px;flex-shrink:0;font-size:1.1rem${!prevDate ? ';opacity:0.3;cursor:not-allowed' : ''}" onclick="${prevDate ? `selectDate('${prevDate}')` : ''}" ${!prevDate ? 'disabled' : ''}>‹</button>
     <div style="text-align:center;flex:1">
       <div class="section-label" style="margin-bottom:2px">Fecha seleccionada</div>
       <div style="font-family:Georgia,serif;font-size:1.25rem;font-weight:700">${formatDateHuman(bookState.date)}</div>
     </div>
-    <button class="cal-nav-btn" style="width:40px;height:40px;flex-shrink:0;font-size:1.1rem" onclick="${nextDate ? `selectDate('${nextDate}')` : ''}" ${!nextDate ? 'disabled style="opacity:0.3;cursor:not-allowed;width:40px;height:40px;flex-shrink:0"' : ''}>›</button>
+    <button class="cal-nav-btn" style="width:40px;height:40px;flex-shrink:0;font-size:1.1rem${!nextDate ? ';opacity:0.3;cursor:not-allowed' : ''}" onclick="${nextDate ? `selectDate('${nextDate}')` : ''}" ${!nextDate ? 'disabled' : ''}>›</button>
   </div>
   <div class="section-label">Elige un horario</div>
   <div class="time-grid">`;
@@ -5518,12 +5605,12 @@ function renderOOHModal() {
     const [selH, selM] = oohState.time ? oohState.time.split(':') : ['', ''];
     timeHtml = `<div class="section-label">Hora preferida</div>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
-      <select id="oohHour" style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 8px;font-size:1rem;font-weight:700;outline:none;cursor:pointer;flex:1" onchange="oohState.time=this.value+':'+(document.getElementById('oohMin').value||'00')">
+      <select id="oohHour" aria-label="Hora" style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 8px;font-size:1rem;font-weight:700;outline:none;cursor:pointer;flex:1" onchange="oohState.time=this.value+':'+(document.getElementById('oohMin').value||'00')">
         <option value="">HH</option>
         ${hours.map(h=>`<option value="${h}" ${h===selH?'selected':''}>${h}</option>`).join('')}
       </select>
       <span style="color:var(--gold);font-size:1.4rem;font-weight:900">:</span>
-      <select id="oohMin" style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 8px;font-size:1rem;font-weight:700;outline:none;cursor:pointer;flex:1" onchange="oohState.time=(document.getElementById('oohHour').value||'00')+':'+this.value">
+      <select id="oohMin" aria-label="Minutos" style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 8px;font-size:1rem;font-weight:700;outline:none;cursor:pointer;flex:1" onchange="oohState.time=(document.getElementById('oohHour').value||'00')+':'+this.value">
         <option value="">MM</option>
         ${mins.map(mm=>`<option value="${mm}" ${mm===selM?'selected':''}>${mm}</option>`).join('')}
       </select>
@@ -5809,7 +5896,7 @@ function confirmChangeArchivedStatus(apptId, newStatus) {
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2.5rem;margin-bottom:10px">✂️</div>
       <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:8px">${displayName}</div>
-      <div style="font-size:0.85rem;color:var(--text3);line-height:1.6">¿Cambiar a <strong>${labelMap[newStatus]}</strong>?${newStatus==='done' && found.entry.status==='no-show' ? '<br>Se revertirá la multa aplicada si la hubiera.' : ''}</div>
+      <div style="font-size:0.85rem;color:var(--text3);line-height:1.6">¿Cambiar a <strong>${labelMap[newStatus]}</strong>?${newStatus==='done' && (found.entry.status==='no-show' || found.entry.status==='late') ? '<br>Se revertirá la multa aplicada si la hubiera.' : ''}</div>
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
@@ -5824,13 +5911,18 @@ function doChangeArchivedStatus(apptId, newStatus) {
   const { client, entry } = found;
   const prevStatus = entry.status;
   if (prevStatus === newStatus) return;
-  // Revertir multa si el estado anterior era no-show y ya no lo es
-  if (prevStatus === 'no-show' && newStatus !== 'no-show' && client.fineAmount > 0) {
+  // 'late' y 'no-show' llevan ambos +5€ (doLate/doNoShow). Mismas reglas que las
+  // correcciones de citas no archivadas: doChangeToDone, doChangeDoneToLate,
+  // doChangeDoneToNoShow, doChangeToLate y doChangeToNoShow.
+  const _fined = s => s === 'late' || s === 'no-show';
+  const _applyFine = !_fined(prevStatus) && _fined(newStatus);
+  // Revertir multa si el estado anterior tenía multa y el nuevo no
+  if (_fined(prevStatus) && !_fined(newStatus) && client.fineAmount > 0) {
     client.fineAmount = Math.max(0, (client.fineAmount || 0) - 5);
-    if (client.fineAmount === 0) client.pendingFine = false;
+    if (client.fineAmount === 0) { client.pendingFine = false; _intentionallyClearedFines.add(client.id); }
   }
-  // Aplicar multa si el nuevo estado es no-show y antes no lo era
-  if (newStatus === 'no-show' && prevStatus !== 'no-show') {
+  // Aplicar multa si el nuevo estado tiene multa y el anterior no
+  if (_applyFine) {
     client.pendingFine = true;
     client.fineAmount = (client.fineAmount || 0) + 5;
   }
@@ -5840,8 +5932,8 @@ function doChangeArchivedStatus(apptId, newStatus) {
   const msg = newStatus === 'done'
     ? `✂️ Tu cita del ${dateH} a las ${entry.time} ha sido corregida a <strong>realizada</strong>. ¡Hasta la próxima!`
     : newStatus === 'no-show'
-      ? `🚫 Tu cita del ${dateH} a las ${entry.time} ha sido corregida a <strong>no te presentaste</strong>. Se aplica <strong>+5€</strong> de multa a tu próximo corte.`
-      : `⏰ Tu cita del ${dateH} a las ${entry.time} ha sido corregida a <strong>llegó tarde</strong>.`;
+      ? `🚫 Tu cita del ${dateH} a las ${entry.time} ha sido corregida a <strong>no te presentaste</strong>.${_applyFine ? ' Se aplica <strong>+5€</strong> de multa a tu próximo corte.' : ''}`
+      : `⏰ Tu cita del ${dateH} a las ${entry.time} ha sido corregida a <strong>llegó tarde</strong>.${_applyFine ? ' Se aplica <strong>+5€</strong> de multa a tu próximo corte.' : ''}`;
   addNotif(client.id, msg, newStatus === 'no-show' ? 'cancel' : '');
   saveDB();
   showToast('Estado corregido ✓', 'success');
@@ -5894,7 +5986,7 @@ function doChangeToDone(apptId) {
     // Revertir multa si venía de no-show o late (se había aplicado +5€)
     if ((prevStatus === 'no-show' || prevStatus === 'late') && client.fineAmount > 0) {
       client.fineAmount = Math.max(0, (client.fineAmount || 0) - 5);
-      if (client.fineAmount === 0) client.pendingFine = false;
+      if (client.fineAmount === 0) { client.pendingFine = false; _intentionallyClearedFines.add(client.id); }
     }
     const histEntry = (client.cutHistory || []).find(h => h.apptId === apptId);
     if (histEntry) histEntry.status = 'done';
@@ -5924,7 +6016,7 @@ function confirmChangeDoneToLate(apptId) {
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2.5rem;margin-bottom:10px">⏰</div>
       <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:8px">${displayName}</div>
-      <div style="font-size:0.85rem;color:var(--text3);line-height:1.6">¿Cambiar de <span style="color:var(--green);font-weight:700">Realizada</span> a <span style="color:var(--gold);font-weight:700">Llegó tarde</span>?<br>La multa ya está aplicada.</div>
+      <div style="font-size:0.85rem;color:var(--text3);line-height:1.6">¿Cambiar de <span style="color:var(--green);font-weight:700">Realizada</span> a <span style="color:var(--gold);font-weight:700">Llegó tarde</span>?<br>Se aplicará una multa de +5€.</div>
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
@@ -5971,7 +6063,7 @@ function confirmChangeDoneToNoShow(apptId) {
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2.5rem;margin-bottom:10px">🚫</div>
       <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:8px">${displayName}</div>
-      <div style="font-size:0.85rem;color:var(--text3);line-height:1.6">¿Cambiar de <span style="color:var(--green);font-weight:700">Realizada</span> a <span style="color:var(--red);font-weight:700">No se presentó</span>?<br>La multa ya está aplicada. El corte <strong>no</strong> contará en el historial.</div>
+      <div style="font-size:0.85rem;color:var(--text3);line-height:1.6">¿Cambiar de <span style="color:var(--green);font-weight:700">Realizada</span> a <span style="color:var(--red);font-weight:700">No se presentó</span>?<br>Se aplicará una multa de +5€. El corte <strong>no</strong> contará en el historial.</div>
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
@@ -6455,7 +6547,7 @@ function manualAddCutStepDate(isPast, isOOH) {
   openModal('✂️ Añadir corte', `
     <div style="text-align:center;padding:6px 0 16px">
       <div style="font-size:0.85rem;color:var(--text3);margin-bottom:14px">Paso 3 de 5 · Elige la fecha del corte (${isOOH ? 'Fuera de horario' : 'Corte normal'})</div>
-      <input type="date" id="manualCutDate" class="input" value="${todayD}" ${isPast ? `max="${todayD}"` : `min="${todayD}"`} style="text-align:center;font-family:'Courier New',monospace">
+      <input type="date" id="manualCutDate" aria-label="Fecha del corte" class="input" value="${todayD}" ${isPast ? `max="${todayD}"` : `min="${todayD}"`} style="text-align:center;font-family:'Courier New',monospace">
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal();manualCutStepOOH(${isPast})">Atrás</button>
@@ -6475,7 +6567,7 @@ function manualAddCutStep2(date, isPast, isOOH) {
     <div style="text-align:center;padding:6px 0 16px">
       <div style="font-size:0.85rem;color:var(--text3);margin-bottom:6px">Paso 4 de 5 · Elige la hora (${isOOH ? 'Fuera de horario' : 'Corte normal'})</div>
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:14px;font-family:'Courier New',monospace">${formatDateHuman(date)}</div>
-      <input type="time" id="manualCutTime" class="input" value="12:00" style="text-align:center;font-family:'Courier New',monospace">
+      <input type="time" id="manualCutTime" aria-label="Hora del corte" class="input" value="12:00" style="text-align:center;font-family:'Courier New',monospace">
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal();manualAddCutStepDate(${isPast},${isOOH})">Atrás</button>
@@ -6820,6 +6912,15 @@ function cutsCalMove(dir) {
 // =============================================
 function renderAdmin() {
   if (!APP.isAdmin) { navigate('home'); return ''; }
+  // FIX: el formulario "Publicar alerta" se vuelve a pintar desde cero (tipo HORARIO,
+  // "Para siempre", "Cierre hasta nuevo aviso" sin activar, sin fechas), así que su estado
+  // en memoria debe volver también a cero. Antes sobrevivía a la navegación y al re-render
+  // del sync: un cierre indefinido activado y no publicado se aplicaba al publicar luego un
+  // cierre por fechas, y un precio "Temporal" anterior se reutilizaba aunque se viera "Para siempre".
+  closureState.from = null; closureState.to = null; closureState.selecting = 'from';
+  _indefiniteClosure = false;
+  _priceDuration = 'forever';
+  _priceCalState.from = null; _priceCalState.to = null; _priceCalState.selecting = 'from';
 
   const oohPending = APP.db.oohRequests.filter(r=>r.status==='pending');
 
@@ -6838,8 +6939,8 @@ function renderAdmin() {
   <div class="section-label">👁️ Acceso visual</div>
   <div class="card" style="padding:10px 14px">
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-      <input class="input" id="viewerUserInput" type="text" placeholder="Usuario" value="${APP.db.viewerUser || ''}" autocomplete="off" style="flex:1;min-width:80px;padding:6px 10px;font-size:0.82rem">
-      <input class="input" id="viewerCodeInput" type="text" placeholder="Código" value="${APP.db.viewerCode || ''}" autocomplete="off" style="flex:1;min-width:80px;padding:6px 10px;font-size:0.82rem">
+      <input class="input" id="viewerUserInput" type="text" placeholder="Usuario" value="${escHtml(APP.db.viewerUser || '')}" autocomplete="off" style="flex:1;min-width:80px;padding:6px 10px;font-size:0.82rem">
+      <input class="input" id="viewerCodeInput" type="text" placeholder="Código" value="${escHtml(APP.db.viewerCode || '')}" autocomplete="off" style="flex:1;min-width:80px;padding:6px 10px;font-size:0.82rem">
       <button class="btn btn-gold btn-sm" style="width:auto;padding:6px 12px;font-size:0.8rem;white-space:nowrap" onclick="saveViewerAccess()">Guardar ✓</button>
     </div>
     ${APP.db.viewerUser && APP.db.viewerCode ? '<div style="font-size:0.72rem;color:var(--green);margin-top:6px">✓ Activo — <strong>' + escHtml(APP.db.viewerUser) + '</strong></div>' : '<div style="font-size:0.72rem;color:var(--text3);margin-top:6px">Sin acceso configurado</div>'}
@@ -7099,7 +7200,7 @@ function renderClientList(filter, sortMode) {
   if (html) return html;
   if (blockedOnly) return `<div style="color:var(--text3);font-size:0.82rem;text-align:center;padding:16px">✅ No hay clientes bloqueados</div>`;
   if (pushOnly) return `<div style="color:var(--text3);font-size:0.82rem;text-align:center;padding:16px">🔕 Ningún cliente tiene las notificaciones push activadas</div>`;
-  return `<div style="color:var(--text3);font-size:0.82rem;text-align:center;padding:16px">Sin resultados para "${q}"</div>`;
+  return `<div style="color:var(--text3);font-size:0.82rem;text-align:center;padding:16px">Sin resultados para "${escHtml(q)}"</div>`;
 }
 
 function filterClientList() {
@@ -7194,7 +7295,7 @@ function editAllowedName(phoneKey) {
     <div style="margin-bottom:14px">
       <label class="input-label" for="editNameInput">Nombre del cliente</label>
       <input class="input" id="editNameInput" type="text" value="${escHtml(currentName)}" placeholder="Nombre que le pondrás tú">
-      <div style="font-size:0.75rem;color:var(--text3);margin-top:6px">${phone}</div>
+      <div style="font-size:0.75rem;color:var(--text3);margin-top:6px">${escHtml(phone)}</div>
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal()">Cancelar</button>
@@ -7349,6 +7450,9 @@ function confirmRemovePhone(phoneKey) {
       if (appt.clientId === id && ['pending','confirmed'].includes(appt.status)) {
         appt.status = 'cancelled';
         cancelledDates.add(appt.date);
+        // FIX: borrar los avisos programados en el servidor de la cita cancelada.
+        _cancelLateCheckPush(appt.id);
+        _cancelReminderPush(appt.id);
       }
     });
     cancelledDates.forEach(date => notifyWaitlist(date));
@@ -7375,7 +7479,9 @@ function confirmRemovePhone(phoneKey) {
 function openClientMenu(clientId) {
   const c = APP.db.clients.find(x => x.id === clientId);
   if (!c) return;
-  const name = escHtml(getAdminName(c.id, c.phone) || c.name);
+  // openModal() pone el título con textContent (no interpreta HTML): no escapar aquí,
+  // si no los nombres con ' & < > " se mostraban como &#39; &amp; ...
+  const name = getAdminName(c.id, c.phone) || c.name;
   const isBlocked = !!c.blocked;
   openModal(name, `
     <div style="display:flex;flex-direction:column;gap:10px;padding-top:4px">
@@ -7459,6 +7565,9 @@ function confirmRemoveClient(id) {
     if (appt.clientId === id && ['pending','confirmed'].includes(appt.status)) {
       appt.status = 'cancelled';
       cancelledDates.add(appt.date);
+      // FIX: borrar los avisos programados en el servidor de la cita cancelada.
+      _cancelLateCheckPush(appt.id);
+      _cancelReminderPush(appt.id);
     }
   });
   // Notify waitlist for each date that just freed up
@@ -7560,7 +7669,7 @@ function clearFineFromProfile(clientId) {
   const c = APP.db.clients.find(c => c.id === clientId);
   if (!c) return;
   const displayName = getAdminName(c.id, c.phone) || c.name;
-  openModal('💸 Multa de ' + escHtml(displayName), `
+  openModal('💸 Multa de ' + displayName, `
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2.5rem;margin-bottom:10px">💸</div>
       <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:6px">Multa pendiente: ${c.fineAmount}€</div>
@@ -7742,11 +7851,11 @@ function openRegisterTipModal(preserve) {
     </div>
     <div style="margin-bottom:12px">
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:4px;font-family:var(--font-mono);letter-spacing:0.05em">IMPORTE (€)</div>
-      <input id="regTipAmount" type="text" class="input" value="${_fmtTipEuro(state.amount)}" inputmode="decimal" autocomplete="off" style="width:100%;box-sizing:border-box">
+      <input id="regTipAmount" aria-label="Importe de la propina en euros" type="text" class="input" value="${_fmtTipEuro(state.amount)}" inputmode="decimal" autocomplete="off" style="width:100%;box-sizing:border-box">
     </div>
     <div style="margin-bottom:16px">
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:4px;font-family:var(--font-mono);letter-spacing:0.05em">FECHA</div>
-      <input id="regTipDate" type="date" class="input" value="${state.date}" style="width:100%;box-sizing:border-box">
+      <input id="regTipDate" aria-label="Fecha de la propina" type="date" class="input" value="${state.date}" style="width:100%;box-sizing:border-box">
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost btn-sm" style="flex:1" onclick="APP._regTipState=null;closeModal()">Cancelar</button>
@@ -7874,11 +7983,11 @@ function openRegisterFinePaidModal(preserve) {
     </div>
     <div style="margin-bottom:12px">
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:4px;font-family:var(--font-mono);letter-spacing:0.05em">IMPORTE (€)</div>
-      <input id="regFineAmount" type="number" class="input" value="${state.amount}" min="1" max="500" inputmode="numeric" style="width:100%;box-sizing:border-box">
+      <input id="regFineAmount" aria-label="Importe de la multa en euros" type="number" class="input" value="${state.amount}" min="1" max="500" inputmode="numeric" style="width:100%;box-sizing:border-box">
     </div>
     <div style="margin-bottom:16px">
       <div style="font-size:0.78rem;color:var(--text3);margin-bottom:4px;font-family:var(--font-mono);letter-spacing:0.05em">FECHA DEL COBRO</div>
-      <input id="regFineDate" type="date" class="input" value="${state.date}" style="width:100%;box-sizing:border-box">
+      <input id="regFineDate" aria-label="Fecha del cobro" type="date" class="input" value="${state.date}" style="width:100%;box-sizing:border-box">
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost btn-sm" style="flex:1" onclick="APP._regFineState=null;closeModal()">Cancelar</button>
@@ -7983,12 +8092,12 @@ function applyManualFine(clientId) {
   const c = APP.db.clients.find(c => c.id === clientId);
   if (!c) return;
   const displayName = getAdminName(c.id, c.phone) || c.name;
-  openModal('💸 Aplicar multa a ' + escHtml(displayName), `
+  openModal('💸 Aplicar multa a ' + displayName, `
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2.5rem;margin-bottom:10px">💸</div>
       <div style="font-size:0.85rem;color:var(--text3);margin-bottom:16px">¿Cuánto quieres aplicar de multa?</div>
       <div style="display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:16px">
-        <input type="number" id="manualFineAmount" class="input" value="5" min="1" max="100" inputmode="numeric"
+        <input type="number" id="manualFineAmount" aria-label="Importe de la multa en euros" class="input" value="5" min="1" max="100" inputmode="numeric"
           style="width:80px;text-align:center;font-size:1.4rem;font-weight:900;font-family:'Courier New',monospace">
         <span style="font-size:1.4rem;font-weight:700;color:var(--gold)">€</span>
       </div>
@@ -8020,7 +8129,7 @@ function clearFine(clientId) {
   const c = APP.db.clients.find(c => c.id === clientId);
   if (!c) return;
   const displayName = getAdminName(c.id, c.phone) || c.name;
-  openModal('💸 Multa de ' + escHtml(displayName), `
+  openModal('💸 Multa de ' + displayName, `
     <div style="text-align:center;padding:10px 0 16px">
       <div style="font-size:2.5rem;margin-bottom:10px">💸</div>
       <div style="font-size:1rem;font-weight:600;color:var(--text);margin-bottom:6px">Multa pendiente: ${c.fineAmount}€</div>
@@ -8043,9 +8152,9 @@ function makeTimeSelect(id, value) {
   let mOpts = mins.map(m=>`<option value="${m}" ${m===selM?'selected':''}>${m}</option>`).join('');
   const sel = 'background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 0;font-size:0.9rem;font-weight:700;outline:none;cursor:pointer;width:42px;text-align:center;-webkit-appearance:none;appearance:none;';
   return `<div style="display:flex;align-items:center;gap:1px">
-    <select id="${id}_h" style="${sel}">${hOpts}</select>
+    <select id="${id}_h" aria-label="Hora" style="${sel}">${hOpts}</select>
     <span style="color:var(--gold);font-weight:900;font-size:0.95rem;padding:0 1px">:</span>
-    <select id="${id}_m" style="${sel}">${mOpts}</select>
+    <select id="${id}_m" aria-label="Minutos" style="${sel}">${mOpts}</select>
   </div>`;
 }
 
@@ -8056,10 +8165,11 @@ function initAdminSchedule() {
   let html = '';
   for (let i=0;i<7;i++) {
     const s = APP.db.schedule[i];
+    const _open = (i in _scheduleDraftOpen) ? _scheduleDraftOpen[i] : s.open;
     html += `<div class="day-row" id="dayRow${i}">
-      <div class="day-toggle ${s.open?'on':''}" onclick="toggleDay(${i})" id="dayToggle${i}"></div>
+      <div class="day-toggle ${_open?'on':''}" onclick="toggleDay(${i})" id="dayToggle${i}"></div>
       <div class="day-name">${days[i]}</div>
-      <div class="day-hours" id="dayHours${i}" style="${s.open?'':'display:none'}">
+      <div class="day-hours" id="dayHours${i}" style="${_open?'':'display:none'}">
         ${makeTimeSelect('dayStart'+i, s.start)}
         <span class="day-sep">—</span>
         ${makeTimeSelect('dayEnd'+i, s.end)}
@@ -8069,12 +8179,21 @@ function initAdminSchedule() {
   grid.innerHTML = html;
 }
 
+// FIX: los cambios de abierto/cerrado y de horas son un borrador hasta "Sí, guardar".
+// Antes toggleDay() y doSaveSchedule() modificaban APP.db.schedule directamente: si el admin
+// pulsaba "Cancelar" (o no guardaba), cualquier saveDB() posterior subía el horario sin
+// confirmar, sin la alerta HORARIO y sin la comprobación de citas fuera de horario.
+let _scheduleDraftOpen = {};      // {díaSemana: bool} toggles aún no guardados
+let _pendingScheduleNext = null;  // horario validado a la espera de _doSaveScheduleCommit()
+
 function toggleDay(i) {
-  APP.db.schedule[i].open = !APP.db.schedule[i].open;
+  const _cur = (i in _scheduleDraftOpen) ? _scheduleDraftOpen[i] : APP.db.schedule[i].open;
+  _scheduleDraftOpen[i] = !_cur;
+  const _isOpen = _scheduleDraftOpen[i];
   const toggle = document.getElementById('dayToggle'+i);
   const hours = document.getElementById('dayHours'+i);
-  toggle.classList.toggle('on', APP.db.schedule[i].open);
-  hours.style.display = APP.db.schedule[i].open ? 'flex' : 'none';
+  toggle.classList.toggle('on', _isOpen);
+  hours.style.display = _isOpen ? 'flex' : 'none';
   // FIX: show unsaved indicator so admin knows to tap "Guardar horario"
   const saveBtn = document.getElementById('saveScheduleBtn');
   if (saveBtn) { saveBtn.style.borderColor = 'var(--gold)'; saveBtn.style.color = 'var(--gold)'; }
@@ -8096,6 +8215,12 @@ function saveSchedule() {
 
 function doSaveSchedule() {
   const dayNames = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+  // FIX: trabajar sobre una copia; APP.db.schedule solo cambia en _doSaveScheduleCommit().
+  const _next = {};
+  for (let i=0;i<7;i++) {
+    _next[i] = { ...APP.db.schedule[i] };
+    if (i in _scheduleDraftOpen) _next[i].open = _scheduleDraftOpen[i];
+  }
   for (let i=0;i<7;i++) {
     const sh = document.getElementById('dayStart'+i+'_h');
     const sm = document.getElementById('dayStart'+i+'_m');
@@ -8104,7 +8229,7 @@ function doSaveSchedule() {
     if (sh && sm && eh && em) {
       const startVal = sh.value + ':' + sm.value;
       const endVal = eh.value + ':' + em.value;
-      if (APP.db.schedule[i].open) {
+      if (_next[i].open) {
         const [startH, startM] = startVal.split(':').map(Number);
         const [endH, endM] = endVal.split(':').map(Number);
         const startMins = startH * 60 + startM;
@@ -8118,10 +8243,11 @@ function doSaveSchedule() {
           return;
         }
       }
-      APP.db.schedule[i].start = startVal;
-      APP.db.schedule[i].end = endVal;
+      _next[i].start = startVal;
+      _next[i].end = endVal;
     }
   }
+  _pendingScheduleNext = _next;
 
   // Check if any future appointments fall outside the new schedule slots
   // Exclude OOH (out-of-hours) appointments — they are intentionally outside normal slots
@@ -8132,7 +8258,7 @@ function doSaveSchedule() {
     if (a.note && a.note.includes('Fuera de horario')) return false; // OOH appts are always outside slots by design
     const d = parseDate(a.date);
     const dow = d.getDay();
-    const sched = APP.db.schedule[dow];
+    const sched = _next[dow];
     if (!sched || !sched.open) return true; // day now closed
     const validSlots = generateSlots(sched.start, sched.end, APP.db.slotDuration || 45);
     return !validSlots.includes(a.time); // slot no longer generated
@@ -8165,6 +8291,10 @@ function doSaveSchedule() {
 }
 
 function _doSaveScheduleCommit() {
+  if (!_pendingScheduleNext) return;
+  APP.db.schedule = _pendingScheduleNext;
+  _pendingScheduleNext = null;
+  _scheduleDraftOpen = {};
   showToast('Horario guardado ✓', 'success');
   addAlertBroadcast('HORARIO', 'El barbero ha actualizado su horario. Consulta la app para ver la disponibilidad actualizada.');
   saveDB(); // FIX arreglo-3: guardar DESPUES de addAlertBroadcast para incluir la alerta en un solo guardado
@@ -8564,6 +8694,10 @@ function doPublishAlert() {
           }
         });
       }
+      // FIX: borrar también los avisos programados en el servidor (retraso y recordatorio 24h),
+      // igual que confirmCancelFullDay(); si no, siguen saliendo para una cita ya cancelada.
+      _cancelLateCheckPush(appt.id);
+      _cancelReminderPush(appt.id);
     });
     APP.db.indefiniteClosure = true;
     if (!APP.db.blockedDays) APP.db.blockedDays = [];
@@ -8610,6 +8744,9 @@ function doPublishAlert() {
           }
         });
       }
+      // FIX: borrar los avisos programados en el servidor (ver cierre indefinido arriba).
+      _cancelLateCheckPush(appt.id);
+      _cancelReminderPush(appt.id);
     });
     // Block all days in range
     // FIX: use parseDate() instead of fragile new Date(...array.map()) spread syntax
@@ -9117,7 +9254,11 @@ function startRealTimeSync() {
             if (!Array.isArray(remoteClients)) return Array.isArray(localClients) ? localClients : [];
             const localArr = Array.isArray(localClients) ? localClients : [];
             const remoteClientsById = new Map(remoteClients.map(c => [c.id, c]));
-            let merged = localArr.map(lc => {
+            const _histBase = _cutHistBaseMap();
+            // FIX: igual que en _pushDBToSupabase(): un cliente ya sincronizado que falta en
+            // remoto fue eliminado en otro dispositivo — quitarlo aquí también (así funciona la
+            // expulsión de sesión de abajo y no se resucita en el siguiente guardado).
+            let merged = localArr.filter(lc => remoteClientsById.has(lc.id) || !_wasSyncedAndRemoved('clients', lc.id)).map(lc => {
               const rc = remoteClientsById.get(lc.id);
               if (!rc) return lc;
               const merged2 = { ...lc };
@@ -9142,9 +9283,7 @@ function startRealTimeSync() {
               if (typeof rc.blocked === 'boolean') merged2.blocked = rc.blocked;
               if (Array.isArray(rc.cutHistory)) {
                 const localHist = Array.isArray(lc.cutHistory) ? lc.cutHistory : [];
-                const localApptIds = new Set(localHist.map(h => h.apptId));
-                const onlyRemoteHist = rc.cutHistory.filter(h => !localApptIds.has(h.apptId));
-                merged2.cutHistory = _dedupeCutHistory([...localHist, ...onlyRemoteHist], remote.removedCutIds);
+                merged2.cutHistory = _dedupeCutHistory(_mergeCutHistory(lc.id, localHist, rc.cutHistory, _histBase), remote.removedCutIds);
               }
               if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
                 merged2.totalCuts = rc.totalCuts;
@@ -9408,16 +9547,25 @@ function checkDailyReset() {
     const client = APP.db.clients.find(c => c.id === appt.clientId);
     if (client) {
       if (!client.cutHistory) client.cutHistory = [];
+      // FIX: precio del archivo = el cobrado o, si no consta, el fijado al reservar (bookedPrice).
+      // Antes se ignoraba bookedPrice; y las rutas que ya habían creado la entrada sin importe
+      // (auto-realizada a los 15 min, "Sí, llegó", llegó tarde, correcciones...) se saltaban aquí
+      // por el control de duplicados, así que al día siguiente el corte se valoraba con el
+      // precio vigente en ese momento y no con el de la reserva.
+      const _isOOH = appt.note && appt.note.includes('Fuera de horario');
+      const _archivePrice = appt.amountPaid != null
+        ? appt.amountPaid
+        : appt.bookedPrice != null
+          ? appt.bookedPrice
+          : (_isOOH ? getEffectivePrice(appt.date) + 5 : getEffectivePrice(appt.date));
+      const _existingHist = client.cutHistory.find(h => h.apptId === appt.id);
+      if (_existingHist && _existingHist.amountPaid == null) _existingHist.amountPaid = _archivePrice;
       // Avoid duplicates
-      if (!client.cutHistory.find(h => h.apptId === appt.id)) {
+      if (!_existingHist) {
         // FIX arreglo-2: guardar el precio efectivo en el momento del archivo.
         // appt.amountPaid ya lo tiene si se marcó como "realizada" desde la UI;
         // si no (e.g. llegó tarde / no-show), calculamos el precio con getEffectivePrice
         // usando la FECHA de la cita, no la de hoy — así el precio histórico es siempre exacto.
-        const _isOOH = appt.note && appt.note.includes('Fuera de horario');
-        const _archivePrice = appt.amountPaid != null
-          ? appt.amountPaid
-          : (_isOOH ? getEffectivePrice(appt.date) + 5 : getEffectivePrice(appt.date));
         client.cutHistory.push({
           apptId: appt.id,
           date: appt.date,
@@ -9581,7 +9729,7 @@ function checkSwapAutoReject() {
 // Started inside DOMContentLoaded (after DB load) so the first tick always has real data.
 function _startPeriodicBackup() {
   setInterval(() => {
-    if (!APP.db.adminPin) return; // don't save an empty DB
+    if (_resetInProgress || !APP.db.adminPin) return; // don't save an empty DB
     try {
       const json = JSON.stringify(APP.db);
       localStorage.setItem('barberbook_db_backup', json);
