@@ -1764,13 +1764,20 @@ function _persistSyncBase() {
 async function _restoreSyncBase() {
   try {
     const raw = await _idbGet('barberbook_sync_base');
-    if (!raw) return;
+    // FIX: sin base guardada (aparato que venía de la versión antigua), tomar la copia
+    // local como base: así lo que el servidor haya cambiado (multas quitadas, cobros...)
+    // gana sobre esa copia vieja en vez de volver a subirla.
+    if (!raw) {
+      _lastSyncedFines = _snapshotSyncedFines(APP.db.clients);
+      _lastSyncedData = _snapshotSyncedData(APP.db);
+      return;
+    }
     const p = JSON.parse(raw);
     if (Array.isArray(p.fines)) _lastSyncedFines = new Map(p.fines);
     if (Array.isArray(p.data)) _lastSyncedData = new Map(p.data);
   } catch(e) {}
 }
-const _SPECIAL_MERGE_KEYS = new Set(['appointments','notifications','oohRequests','swapRequests','pushSubscriptions','blockedDays','clients']);
+const _SPECIAL_MERGE_KEYS = new Set(['appointments','notifications','oohRequests','swapRequests','pushSubscriptions','blockedDays','clients','finesPaidStandalone','tipsStandalone']);
 function _snapshotSyncedData(db) {
   const m = new Map();
   if (db && typeof db === 'object') {
@@ -1835,7 +1842,18 @@ function saveDB() {
   _saveTimer = setTimeout(() => { _saveTimer = null; _pushDBToSupabase(); }, 800);
   _refreshUnsyncedAppts();
   // Always write to IndexedDB immediately (more persistent than localStorage on Safari ITP)
-  _idbSet('barberbook_db_backup', JSON.stringify(APP.db)).catch(() => {});
+  // FIX: marcar que hay cambios sin subir y guardar también la copia en localStorage al
+  // momento. Antes, si la app se cerraba antes de terminar la subida (iOS la mata, sin red),
+  // al volver a abrirla se cargaba solo lo del servidor y el cambio (cobro, propina, multa
+  // pagada...) se perdía para siempre. Ver loadDB().
+  try {
+    const _json = JSON.stringify(APP.db);
+    _idbSet('barberbook_db_backup', _json).catch(() => {});
+    try {
+      localStorage.setItem('barberbook_db_backup', _json);
+      localStorage.setItem('barberbook_unsynced', '1');
+    } catch(e) {}
+  } catch(e) {}
 }
 
 async function _pushDBToSupabase() {
@@ -2027,6 +2045,31 @@ async function _pushDBToSupabase() {
           }
         }
 
+        // FIX: cobros de multas y propinas — unión por id. Antes se trataban como el resto
+        // de claves: si dos dispositivos registraban un cobro casi a la vez, el que guardaba
+        // después (tras el reintento) subía su lista entera y borraba el cobro del otro.
+        // La app nunca borra entradas de estas listas, así que unir no resucita nada.
+        // Para una misma entrada: si la local no ha cambiado desde la última sincronización,
+        // gana la remota (p.ej. un importe corregido en otro sitio); si no, gana la local.
+        ['finesPaidStandalone', 'tipsStandalone'].forEach(k => {
+          if (!Array.isArray(remoteData[k])) return;
+          const loc = Array.isArray(APP.db[k]) ? APP.db[k] : [];
+          let baseArr = null;
+          try { baseArr = _lastSyncedData && _lastSyncedData.has(k) ? JSON.parse(_lastSyncedData.get(k)) : null; } catch(e) {}
+          const baseById = new Map((Array.isArray(baseArr) ? baseArr : []).filter(x => x && x.id).map(x => [x.id, JSON.stringify(x)]));
+          const remById = new Map(remoteData[k].filter(x => x && x.id).map(x => [x.id, x]));
+          const locIds = new Set(loc.filter(x => x && x.id).map(x => x.id));
+          const locNoIdJson = new Set(loc.filter(x => !(x && x.id)).map(x => JSON.stringify(x)));
+          const keptLocal = loc.map(x => {
+            if (!(x && x.id)) return x;
+            const r = remById.get(x.id);
+            if (r && baseById.get(x.id) === JSON.stringify(x)) return r;
+            return x;
+          });
+          const onlyRemote = remoteData[k].filter(x => (x && x.id) ? !locIds.has(x.id) : !locNoIdJson.has(JSON.stringify(x)));
+          APP.db[k] = [...keptLocal, ...onlyRemote];
+        });
+
         // FIX: resto de claves — si este dispositivo no las ha modificado desde la última
         // sincronización, prevalece el valor remoto (no revertir cambios de otro dispositivo).
         if (_lastSyncedData) {
@@ -2111,7 +2154,10 @@ async function _pushDBToSupabase() {
     _persistSyncBase();
     _clearSyncedUnsyncedAppts(_writtenIds.appointments);
     _clearSyncedUnsyncedOOH(_writtenIds.oohRequests);
-    if (_saveGen === _genAtStart) _savePending = false;
+    if (_saveGen === _genAtStart) {
+      _savePending = false;
+      try { localStorage.removeItem('barberbook_unsynced'); } catch(e) {}
+    }
     _saveRetryCount = 0; // reset on success
     if (dot) dot.style.background = 'var(--green)';
   } catch(e) {
@@ -2256,6 +2302,15 @@ async function loadSession() {
 }
 
 async function loadDB() {
+  // FIX: si la última sesión se cerró con cambios sin subir, arrancar desde la copia local
+  // (con la base de sincronización guardada) y subirla: _pushDBToSupabase() la fusiona con
+  // lo que haya en el servidor. Antes se cargaba el servidor y esos cambios se perdían.
+  let _hadUnsynced = false;
+  try { _hadUnsynced = localStorage.getItem('barberbook_unsynced') === '1'; } catch(e) {}
+  if (_hadUnsynced && await _tryLoadLocalBackup()) {
+    saveDB();
+    return;
+  }
   try {
     // Hasta 3 intentos (20s cada uno). Antes había un único intento de 12s: si el servidor
     // iba lento, un cliente sin copia local se quedaba en la pantalla "Sin conexión".
@@ -2415,7 +2470,7 @@ async function _tryLoadLocalBackup() {
         _lastRemoteUpdatedAt = null;
         const dot = document.getElementById('syncDot');
         if (dot) dot.style.background = 'orange';
-        return;
+        return true;
       }
     }
   } catch(e) { console.error('localStorage backup load error:', e); }
@@ -2434,9 +2489,11 @@ async function _tryLoadLocalBackup() {
         try { localStorage.setItem('barberbook_db_backup', raw); } catch(e) {}
         const dot = document.getElementById('syncDot');
         if (dot) dot.style.background = 'orange';
+        return true;
       }
     }
   } catch(e) { console.error('IndexedDB backup load error:', e); }
+  return false;
 }
 
 // =============================================
@@ -3472,12 +3529,15 @@ function confirmResetAll2() {
 
 async function resetAllData() {
   // Only remove BarberBook keys — don't nuke other apps sharing the same origin
-  ['barberbook_db_backup','barberbook_db_backup_ts','barberbook_session'].forEach(k => {
+  // FIX: borrar también la marca de cambios sin subir y la base de sincronización; si no,
+  // al recargar loadDB() volvería a subir la copia antigua y desharía el borrado.
+  ['barberbook_db_backup','barberbook_db_backup_ts','barberbook_session','barberbook_unsynced'].forEach(k => {
     try { localStorage.removeItem(k); } catch(e) {}
   });
   // Also clear IndexedDB so session and DB backup are fully wiped
   await _idbDelete('barberbook_session');
   await _idbDelete('barberbook_db_backup');
+  await _idbDelete('barberbook_sync_base');
   try {
     await sbFetch('/rest/v1/barberbook_db', {
       method: 'POST',
