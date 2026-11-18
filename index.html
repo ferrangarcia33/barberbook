@@ -1094,7 +1094,7 @@ textarea.input { resize: none; min-height: 80px; }
 /* Responsive for larger screens */
 @media (min-width: 600px) {
   .main-content { max-width: 500px; margin: 0 auto; }
-  .bottom-nav { max-width: 500px; left: 50%; transform: translateX(-50%); }
+  .bottom-nav { max-width: 500px; left: 50%; right: auto; width: 100%; transform: translateX(-50%); }
   /* topbar: use fixed instead of sticky so left:50%+transform works correctly */
   .topbar { position: fixed; max-width: 500px; left: 50%; transform: translateX(-50%); width: 500px; }
   /* Push main content down by topbar height since it's now fixed (60px) */
@@ -1204,7 +1204,7 @@ window.addEventListener('beforeinstallprompt', e => {
       <label class="input-label" for="setupSecret2">Confirmar código secreto</label>
       <input class="input" id="setupSecret2" type="password" placeholder="••••••••" inputmode="text">
     </div>
-    <div class="login-error" id="setupError"></div>
+    <div class="login-error" id="setupError" role="alert"></div>
     <button type="button" class="btn btn-gold" onclick="setupAdmin()">Crear cuenta VIP</button>
   </div>
 </div>
@@ -1234,7 +1234,7 @@ window.addEventListener('beforeinstallprompt', e => {
       <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('loginPin')" id="eye_loginPin">👁️</button>
     </div>
       </div>
-      <div class="login-error" id="loginError"></div>
+      <div class="login-error" id="loginError" role="alert"></div>
       <button type="button" class="btn btn-gold" onclick="loginClient()" style="margin-bottom:10px;">Entrar</button>
       <button type="button" class="btn btn-ghost" onclick="showRegister()">Primera vez — Crear cuenta</button>
     </div>
@@ -1250,11 +1250,11 @@ window.addEventListener('beforeinstallprompt', e => {
       <div class="input-group">
         <label class="input-label" for="adminSecret">PIN Secreto</label>
         <div class="pin-wrapper">
-      <input class="input" id="adminSecret" type="password" maxlength="30" placeholder="••••••••" inputmode="text">
+      <input class="input" id="adminSecret" type="password" placeholder="••••••••" inputmode="text">
       <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('adminSecret')" id="eye_adminSecret">👁️</button>
     </div>
       </div>
-      <div class="login-error" id="adminError"></div>
+      <div class="login-error" id="adminError" role="alert"></div>
       <button type="button" class="btn btn-gold" onclick="loginAdmin()">Acceder ✂️</button>
     </div>
   </div>
@@ -1281,7 +1281,7 @@ window.addEventListener('beforeinstallprompt', e => {
       <button type="button" class="pin-eye" aria-label="Mostrar u ocultar PIN" onclick="togglePin('regPin')" id="eye_regPin">👁️</button>
     </div>
     </div>
-    <div class="login-error" id="regError"></div>
+    <div class="login-error" id="regError" role="alert"></div>
     <button type="button" class="btn btn-gold" onclick="registerClient()">Crear cuenta</button>
   </div>
 </div>
@@ -1556,6 +1556,28 @@ const _intentionallyRemovedPushSubs = new Set();
 let _resetInProgress = false;
 // Fila remota existente pero vacía (data = {}), estado que deja resetAllData().
 let _remoteDBEmpty = false;
+// FIX: "Borrar todo" hecho en OTRO dispositivo. resetAllData() deja la fila con data = {}, pero
+// los demás dispositivos conservaban la base en memoria / copia local y, en su siguiente
+// guardado (sin nada que fusionar con {}), la volvían a subir entera: el borrado se deshacía.
+function _isEmptyRemoteData(d) {
+  return !!d && typeof d === 'object' && !Array.isArray(d) && Object.keys(d).length === 0;
+}
+async function _wipeLocalDBCopies() {
+  ['barberbook_db_backup','barberbook_db_backup_ts','barberbook_session','barberbook_unsynced',
+   'barberbook_unsynced_appts','barberbook_unsynced_notify','barberbook_unsynced_ooh'].forEach(k => {
+    try { localStorage.removeItem(k); } catch(e) {}
+  });
+  await _idbDelete('barberbook_session');
+  await _idbDelete('barberbook_db_backup');
+  await _idbDelete('barberbook_sync_base');
+}
+function _handleRemoteReset() {
+  if (_resetInProgress) return;
+  _resetInProgress = true; // bloquea saveDB()/push y los volcados locales, igual que resetAllData()
+  if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+  if (_retryTimer) { clearTimeout(_retryTimer); _retryTimer = null; }
+  _wipeLocalDBCopies().finally(() => location.reload());
+}
 let _savePending = false; // true while a save is debounced or in-flight — block sync during this window
 let _saveRetryCount = 0;  // number of consecutive failed Supabase saves
 const _SAVE_MAX_RETRIES = 5; // stop retrying after this many failures
@@ -1570,6 +1592,10 @@ let _saveGen = 0;
 // la cita no se pierda: al volver a abrir (loadDB) se re-añade y se vuelve a subir.
 // Antes loadDB() reemplazaba las citas por las del servidor y la reserva desaparecía.
 const _UNSYNCED_APPTS_KEY = 'barberbook_unsynced_appts';
+// FIX: reservas de ESTE dispositivo descartadas al guardar porque otro dispositivo ya había
+// guardado antes una cita en ese mismo hueco (ver _pushDBToSupabase). _waitBookingSaved()
+// lo consulta para no decir "Cita confirmada" de una reserva que no se ha guardado.
+const _lostBookingIds = new Set();
 function _getUnsyncedAppts() {
   try {
     const v = JSON.parse(localStorage.getItem(_UNSYNCED_APPTS_KEY) || '[]');
@@ -1843,6 +1869,31 @@ function _cutHistBaseMap() {
   } catch(e) {}
   return m;
 }
+// FIX: el resto de campos de cada cliente (name, normasAckVersion, pin, phone...) se tomaba
+// siempre de la copia local, tanto en el poll como al guardar. Un cambio hecho en otro
+// dispositivo (el barbero renombra al cliente, el cliente confirma las normas) no llegaba a
+// los dispositivos que ya tenían al cliente en memoria y, en cuanto uno de ellos guardaba,
+// lo revertía en Supabase. Mismo criterio que _mergeCutHistory y las claves generales: si
+// el campo local no ha cambiado desde la última sincronización, gana el remoto. Los campos
+// con fusión propia (multas, bloqueo, historial, total de cortes) no se tocan aquí.
+const _CLIENT_SPECIAL_FIELDS = new Set(['pendingFine','fineAmount','blocked','cutHistory','totalCuts']);
+function _clientBaseMap() {
+  try {
+    const raw = _lastSyncedData && _lastSyncedData.get('clients');
+    const arr = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(arr)) return null;
+    return new Map(arr.filter(c => c && c.id).map(c => [c.id, c]));
+  } catch(e) { return null; }
+}
+function _takeRemoteClientFields(merged2, lc, rc, baseMap) {
+  const base = baseMap && baseMap.get(lc.id);
+  if (!base) return merged2;
+  Object.keys(rc).forEach(k => {
+    if (_CLIENT_SPECIAL_FIELDS.has(k)) return;
+    if (JSON.stringify(lc[k]) === JSON.stringify(base[k])) merged2[k] = rc[k];
+  });
+  return merged2;
+}
 function _mergeCutHistory(clientId, localHist, remoteHist, baseMap) {
   const remoteById = new Map(remoteHist.filter(h => h && h.apptId).map(h => [h.apptId, h]));
   const localApptIds = new Set(localHist.map(h => h && h.apptId));
@@ -1928,18 +1979,38 @@ async function _pushDBToSupabase() {
       // sbFetch() no lanza: devuelve null ante error HTTP, timeout o fallo de red.
       // Sin esta comprobación, una lectura fallida seguía hacia el upsert sin fusionar.
       if (remote === null) throw new Error('Lectura remota fallida');
+      // FIX: la base remota fue borrada (resetAllData) en otro dispositivo después de que este
+      // la cargase: no volver a subir la copia antigua — limpiar la local y recargar.
+      if (!_remoteDBEmpty && APP.db.adminPin && remote.length > 0 && _isEmptyRemoteData(remote[0].data)) {
+        _handleRemoteReset();
+        return;
+      }
       if (remote && remote.length > 0) _expectedRemoteTs = remote[0].updated_at;
       if (remote && remote.length > 0 && remote[0].data && remote[0].data.appointments) {
         const remoteAppts = remote[0].data.appointments;
         const localAppts = APP.db.appointments;
         const merged = [...localAppts];
         const CLOSED_STATUSES = ['done','late','no-show','cancelled'];
+        // FIX: base de la última sincronización por id de cita. Si la copia local de una cita no
+        // ha cambiado desde entonces, gana la remota (mismo criterio que cutHistory y los campos
+        // de cliente). Antes, entre dos citas activas ganaba siempre la local: un dispositivo con
+        // copia atrasada revertía en Supabase un intercambio de hora ya aceptado (la solicitud
+        // quedaba "accepted" pero con las horas antiguas) o una corrección de estado.
+        let _apptBaseById = null;
+        try {
+          const _rawApptBase = _lastSyncedData && _lastSyncedData.get('appointments');
+          const _apptBaseArr = _rawApptBase ? JSON.parse(_rawApptBase) : null;
+          if (Array.isArray(_apptBaseArr)) _apptBaseById = new Map(_apptBaseArr.filter(x => x && x.id).map(x => [x.id, JSON.stringify(x)]));
+        } catch(e) { _apptBaseById = null; }
         remoteAppts.forEach(ra => {
           const localIdx = merged.findIndex(la => la.id === ra.id);
           if (localIdx === -1) {
             // Cita nueva en remoto (creada por otro usuario) → añadir
             // FIX: salvo que ya estuviera sincronizada y se haya eliminado localmente
             if (!_wasSyncedAndRemoved('appointments', ra.id)) merged.push(ra);
+          } else if (_apptBaseById && _apptBaseById.get(ra.id) === JSON.stringify(merged[localIdx])) {
+            // Sin cambios locales desde la última sincronización → el remoto gana
+            merged[localIdx] = ra;
           } else {
             // Cita existente: si remoto la tiene cerrada y local activa, el remoto gana
             // (evita resucitar citas canceladas/completadas en otro dispositivo)
@@ -1951,6 +2022,39 @@ async function _pushDBToSupabase() {
           }
         });
         APP.db.appointments = merged;
+        // FIX: reserva doble. La unión de arriba conservaba a la vez la reserva hecha aquí (aún sin
+        // subir) y la que otro dispositivo ya había guardado en el mismo hueco (o del mismo cliente
+        // ese día), y se subían las dos. Mismo criterio que _restoreUnsyncedAppts(): gana la que ya
+        // está en el servidor y la reserva local se descarta (con su aviso "Nueva cita" al barbero).
+        const _unsyncedNow = _getUnsyncedAppts();
+        if (_unsyncedNow.length) {
+          const _ACTIVE_ST = ['pending','confirmed'];
+          const _remoteApptIds = new Set(remoteAppts.map(ra => ra && ra.id));
+          const _lostNow = new Set();
+          _unsyncedNow.forEach(p => {
+            const la = APP.db.appointments.find(a => a.id === p.id);
+            if (!la || _remoteApptIds.has(la.id) || !_ACTIVE_ST.includes(la.status)) return;
+            const _clash = remoteAppts.some(ra => ra && ra.id !== la.id && _ACTIVE_ST.includes(ra.status) &&
+              ra.date === la.date && (ra.time === la.time || ra.clientId === la.clientId));
+            if (_clash) _lostNow.add(la.id);
+          });
+          if (_lostNow.size) {
+            const _notifMap = _getUnsyncedNotify();
+            APP.db.appointments = APP.db.appointments.filter(a => !_lostNow.has(a.id));
+            _lostNow.forEach(id => {
+              const _msg = _notifMap[id];
+              if (_msg) {
+                const _nl = APP.db.notifications || [];
+                for (let i = _nl.length - 1; i >= 0; i--) {
+                  if (_nl[i] && _nl[i].userId === 'admin' && _nl[i].msg === _msg) { _nl.splice(i, 1); break; }
+                }
+              }
+              _dropBookingNotify(id);
+              _lostBookingIds.add(id);
+            });
+            _setUnsyncedAppts(_getUnsyncedAppts().filter(x => !_lostNow.has(x.id)));
+          }
+        }
 
         // FIX bug6: además de appointments, mergear (por id, sin descartar nada)
         // notifications, oohRequests, pushSubscriptions y los datos de multas/historial
@@ -1977,7 +2081,9 @@ async function _pushDBToSupabase() {
           // dispositivo atrasado devolvía a "pending" una solicitud ya aceptada por el barbero.
           const _oohRank = { pending: 0, accepted: 1, rejected: 1 };
           const _remoteOOHById = new Map(remoteData.oohRequests.map(r => [r.id, r]));
-          const _keptLocalOOH = localOOH.map(loc => {
+          // FIX: una solicitud ya sincronizada que falta en remoto se eliminó en otro dispositivo
+          // (cliente borrado, limpieza de 30 días): no volver a subirla. Mismo criterio que clients.
+          const _keptLocalOOH = localOOH.filter(loc => _remoteOOHById.has(loc.id) || !_wasSyncedAndRemoved('oohRequests', loc.id)).map(loc => {
             const rr = _remoteOOHById.get(loc.id);
             if (rr && (_oohRank[rr.status] || 0) > (_oohRank[loc.status] || 0)) return rr;
             return loc;
@@ -2008,7 +2114,8 @@ async function _pushDBToSupabase() {
             return loc;
           });
           const remoteIds = new Set(remoteData.swapRequests.map(r => r.id));
-          localSwap.forEach(loc => { if (!remoteIds.has(loc.id)) merged.push(loc); });
+          // FIX: no re-subir una solicitud ya sincronizada que se eliminó en otro dispositivo.
+          localSwap.forEach(loc => { if (!remoteIds.has(loc.id) && !_wasSyncedAndRemoved('swapRequests', loc.id)) merged.push(loc); });
           APP.db.swapRequests = merged;
         }
 
@@ -2034,6 +2141,7 @@ async function _pushDBToSupabase() {
           const localClients = APP.db.clients || [];
           const remoteClientsById = new Map(remoteData.clients.map(c => [c.id, c]));
           const _histBase = _cutHistBaseMap();
+          const _clientBase = _clientBaseMap();
           // FIX: un cliente que estaba en la última base sincronizada y ya no está en remoto
           // fue eliminado en otro dispositivo — no volver a subirlo. Los creados aquí y aún
           // sin subir no están en _lastSyncedIds y se conservan.
@@ -2072,6 +2180,13 @@ async function _pushDBToSupabase() {
             if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
               merged2.totalCuts = rc.totalCuts;
             }
+            _takeRemoteClientFields(merged2, lc, rc, _clientBase);
+            // FIX: "blocked" no tenía regla al guardar (sí en loadDB y en el poll) y está excluido
+            // de _takeRemoteClientFields: ganaba siempre la copia local, y un dispositivo atrasado
+            // deshacía en Supabase un bloqueo/desbloqueo hecho en otro. Mismo criterio que el resto
+            // de campos: si el valor local no ha cambiado desde la última sincronización, gana el remoto.
+            const _blkBase = _clientBase && _clientBase.get(lc.id);
+            if (_blkBase && ('blocked' in rc) && JSON.stringify(lc.blocked) === JSON.stringify(_blkBase.blocked)) merged2.blocked = rc.blocked;
             return merged2;
           });
           // Clientes nuevos creados en otro dispositivo que aún no están en local
@@ -2182,6 +2297,7 @@ async function _pushDBToSupabase() {
     // If Supabase returns the row, grab its updated_at; otherwise fall back to local now.
     const savedTs = (Array.isArray(res) && res[0] && res[0].updated_at) ? res[0].updated_at : now;
     _lastRemoteUpdatedAt = savedTs;
+    if (APP.db.adminPin) _remoteDBEmpty = false; // la fila remota ya no está vacía
     _removedSubsWritten.forEach(k => _intentionallyRemovedPushSubs.delete(k));
     _clearedFinesWritten.forEach(k => _intentionallyClearedFines.delete(k));
     _unblockedDaysWritten.forEach(d => _intentionallyUnblockedDays.delete(d));
@@ -2459,7 +2575,13 @@ async function loadDB() {
       // mostrar "Sin conexión" (que se quedaba para siempre, aunque sí hay conexión).
       if (rows && rows.length > 0 && rows[0].data && typeof rows[0].data === 'object' && Object.keys(rows[0].data).length === 0) _remoteDBEmpty = true;
       // Supabase returned nothing — try localStorage/IndexedDB backup before giving up
-      await _tryLoadLocalBackup();
+      // FIX: si el servidor respondió con la base vacía (borrada con "Borrar todo"), la copia
+      // local es anterior al borrado: cargarla mostraba los datos antiguos y el siguiente
+      // guardado los volvía a subir. Se descarta para ir a la pantalla de configuración.
+      if (_remoteDBEmpty) await _wipeLocalDBCopies();
+      // FIX: el servidor respondió pero sin fila 'main' (rows = []) y no hay copia local:
+      // es la primera instalación, no un corte de red. Ir a configuración en vez de "Sin conexión".
+      else if (!(await _tryLoadLocalBackup()) && Array.isArray(rows) && rows.length === 0) _remoteDBEmpty = true;
     }
   } catch(e) {
     console.error('loadDB error:', e);
@@ -2654,9 +2776,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!APP.db.adminPin) {
       // Intenta detectar si hay conexión real al servidor de Supabase
       // FIX: verificar que el backup tenga adminPin válido, no solo que exista la clave
-      const _rawBackup = localStorage.getItem('barberbook_db_backup');
       let _backupHasData = false;
-      try { const _p = _rawBackup ? JSON.parse(_rawBackup) : null; _backupHasData = !!(_p && _p.adminPin); } catch(e) {}
+      try { const _rawBackup = localStorage.getItem('barberbook_db_backup'); const _p = _rawBackup ? JSON.parse(_rawBackup) : null; _backupHasData = !!(_p && _p.adminPin); } catch(e) {}
       const _noBackup = !_backupHasData;
       if (_noBackup && !_remoteDBEmpty) {
         // No hay datos en ningún lado — casi seguro es la primera vez sin conexión
@@ -2819,7 +2940,15 @@ async function _processPendingPushAnswers(force) {
       if (row.answer !== 'yes' && row.answer !== 'no') return;
       const arrived = row.answer === 'yes';
       const appt = APP.db.appointments.find(a => a.id === apptId);
-      if (!appt || !['pending','confirmed'].includes(appt.status)) return;
+      if (!appt) return;
+      if (!['pending','confirmed'].includes(appt.status)) {
+        // FIX: la cita ya está cerrada, así que esta respuesta no se aplicará nunca. Antes se salía
+        // sin borrar la fila y quedaba en late_checks_pending para siempre (se volvía a descargar
+        // en cada arranque/login). Solo se borra si la cita existe aquí: si falta (copia local
+        // atrasada) se conserva para no perder una respuesta que aún podría aplicarse.
+        sbFetch('/rest/v1/late_checks_pending?id=eq.' + apptId, { method: 'DELETE' });
+        return;
+      }
       // Marcar según la respuesta
       if (arrived) {
         appt.status = 'done';
@@ -2959,6 +3088,9 @@ function showApp() {
     const topNotif = document.getElementById('notifBtn');
     if (topSyncDot) topSyncDot.style.display = 'none';
     if (topNotif) topNotif.style.display = 'none';
+    // FIX: logout() detiene el sync; esta rama salía antes del startRealTimeSync() de abajo,
+    // así que un visor que entraba tras un cierre de sesión se quedaba sin sincronización.
+    startRealTimeSync();
     navigate('book');
     return;
   }
@@ -2996,6 +3128,8 @@ function showApp() {
   // startRealTimeSync is idempotent (guards with _syncIntervalId check) so safe to call here.
   startRealTimeSync();
   navigate('home');
+  // Reparar la suscripción push de este móvil si se ha perdido o renovado (ver _autoSyncPushSub).
+  _autoSyncPushSub(true);
 }
 
 function logout() {
@@ -3155,7 +3289,7 @@ function acceptSwap(reqId) {
   // Notify admin
   const _requesterClientAS = APP.db.clients.find(c => c.id === req.fromClientId);
   const _requesterNameAS = _requesterClientAS ? (getAdminName(_requesterClientAS.id, _requesterClientAS.phone) || _requesterClientAS.name) : req.fromClientName;
-  addNotif('admin', `✅ <strong>${acceptorName}</strong> ha aceptado el cambio de hora con <strong>${escHtml(_requesterNameAS)}</strong> el ${formatDateHuman(req.date)}.`);
+  addNotif('admin', `✅ <strong>${acceptorName}</strong> ha aceptado el cambio de hora con <strong>${_requesterNameAS}</strong> el ${formatDateHuman(req.date)}.`);
   saveDB();
   showToast('Cambio aceptado ✓', 'success');
   navigate('home');
@@ -3175,7 +3309,7 @@ function rejectSwap(reqId) {
   const _rejectTargetName = _rejectTarget ? (getAdminName(_rejectTarget.id, _rejectTarget.phone) || _rejectTarget.name) : 'Un cliente';
   const _requesterClientRS = APP.db.clients.find(c => c.id === req.fromClientId);
   const _requesterNameRS = _requesterClientRS ? (getAdminName(_requesterClientRS.id, _requesterClientRS.phone) || _requesterClientRS.name) : req.fromClientName;
-  addNotif('admin', `❌ <strong>${escHtml(_rejectTargetName)}</strong> ha rechazado el cambio de hora solicitado por <strong>${escHtml(_requesterNameRS)}</strong> el ${formatDateHuman(req.date)}.`);
+  addNotif('admin', `❌ <strong>${_rejectTargetName}</strong> ha rechazado el cambio de hora solicitado por <strong>${_requesterNameRS}</strong> el ${formatDateHuman(req.date)}.`);
   saveDB();
   showToast('Cambio rechazado', 'info');
   // FIX reactivity: if notifications modal is open, refresh it in-place
@@ -3588,18 +3722,12 @@ async function resetAllData() {
   _resetInProgress = true;
   if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
   if (_retryTimer) { clearTimeout(_retryTimer); _retryTimer = null; }
-  // Only remove BarberBook keys — don't nuke other apps sharing the same origin
-  // FIX: borrar también la marca de cambios sin subir y la base de sincronización; si no,
-  // al recargar loadDB() volvería a subir la copia antigua y desharía el borrado.
-  ['barberbook_db_backup','barberbook_db_backup_ts','barberbook_session','barberbook_unsynced'].forEach(k => {
-    try { localStorage.removeItem(k); } catch(e) {}
-  });
-  // Also clear IndexedDB so session and DB backup are fully wiped
-  await _idbDelete('barberbook_session');
-  await _idbDelete('barberbook_db_backup');
-  await _idbDelete('barberbook_sync_base');
+  // FIX: vaciar primero la base del servidor y comprobar el resultado. sbFetch() no lanza
+  // (devuelve null ante error HTTP, timeout o fallo de red), así que el try/catch no detectaba
+  // el fallo: se borraban las copias locales, se recargaba y el servidor seguía con todos los datos.
+  let _resetRes = null;
   try {
-    await sbFetch('/rest/v1/barberbook_db', {
+    _resetRes = await sbFetch('/rest/v1/barberbook_db', {
       method: 'POST',
       headers: {
         'Prefer': 'resolution=merge-duplicates,return=minimal',
@@ -3607,7 +3735,25 @@ async function resetAllData() {
       },
       body: JSON.stringify({ id: 'main', data: {}, updated_at: new Date().toISOString() })
     });
-  } catch(e) {}
+  } catch(e) { _resetRes = null; }
+  if (_resetRes === null) {
+    _resetInProgress = false;
+    if (_savePending) saveDB(); // reprograma el guardado pendiente cancelado arriba
+    closeModal();
+    showToast('⚠️ No se pudo confirmar el borrado en el servidor. Comprueba la conexión e inténtalo de nuevo.', 'error');
+    return;
+  }
+  // Only remove BarberBook keys — don't nuke other apps sharing the same origin
+  // FIX: borrar también la marca de cambios sin subir y la base de sincronización; si no,
+  // al recargar loadDB() volvería a subir la copia antigua y desharía el borrado.
+  ['barberbook_db_backup','barberbook_db_backup_ts','barberbook_session','barberbook_unsynced',
+   'barberbook_unsynced_appts','barberbook_unsynced_notify','barberbook_unsynced_ooh'].forEach(k => {
+    try { localStorage.removeItem(k); } catch(e) {}
+  });
+  // Also clear IndexedDB so session and DB backup are fully wiped
+  await _idbDelete('barberbook_session');
+  await _idbDelete('barberbook_db_backup');
+  await _idbDelete('barberbook_sync_base');
   location.reload();
 }
 
@@ -3665,7 +3811,7 @@ async function loginClient() {
     pin === db.viewerCode;
 
   if (_checkViewer(APP.db)) {
-    APP.currentUser = { id: '_viewer', name: APP.db.viewerUser, phone: '' };
+    APP.currentUser = { id: '_viewer', name: APP.db.viewerUser, phone: '', code: APP.db.viewerCode };
     APP.isAdmin = false;
     APP.isViewer = true;
     saveSession();
@@ -3681,7 +3827,7 @@ async function loginClient() {
       if (_checkViewer(freshDb)) {
         APP.db.viewerUser = freshDb.viewerUser;
         APP.db.viewerCode = freshDb.viewerCode;
-        APP.currentUser = { id: '_viewer', name: freshDb.viewerUser, phone: '' };
+        APP.currentUser = { id: '_viewer', name: freshDb.viewerUser, phone: '', code: freshDb.viewerCode };
         APP.isAdmin = false;
         APP.isViewer = true;
         saveSession();
@@ -3800,7 +3946,11 @@ async function registerClient() {
   if (pin.length < 6 || !/^\d+$/.test(pin)) { err.textContent = 'PIN debe tener mínimo 6 dígitos numéricos'; err.style.display='block'; return; }
 
   // Check if phone is in allowed list
-  const allowed = APP.db.allowedPhones.find(p => normalizePhone(typeof p === 'object' ? p.phone : p) === phone);
+  // FIX: misma equivalencia de número que el login y que la comprobación de "ya registrado"
+  // de abajo (últimos 9 dígitos). Antes "+34 612 345 678" o "612-345-678" se rechazaban como
+  // "no está en la lista" aunque el barbero tuviera 612345678. Primero se busca coincidencia exacta.
+  const allowed = APP.db.allowedPhones.find(p => normalizePhone(typeof p === 'object' ? p.phone : p) === phone)
+    || APP.db.allowedPhones.find(p => { const ph = typeof p === 'object' ? p.phone : p; return digitsOnly(phone).length >= 9 && digitsOnly(ph).slice(-9) === digitsOnly(phone).slice(-9); });
   if (!allowed) {
     err.textContent = '⚠️ Tu número no está en la lista. Contacta con el barbero.';
     err.style.display='block'; return;
@@ -3813,9 +3963,19 @@ async function registerClient() {
 
   // Hash PIN with PBKDF2 (salted) before storing — never keep plain text in Supabase
   const pinHash = await _hashPin(pin);
+  // FIX: volver a comprobar tras el await. _hashPin (PBKDF2, 100 000 iteraciones) tarda lo
+  // suficiente para que un doble toque en "Crear cuenta" pase dos veces la comprobación de
+  // arriba antes de que la primera llamada añada el cliente: se creaban dos cuentas con el mismo número.
+  if (APP.db.clients.find(c => normalizePhone(c.phone) === phone || barePhone(c.phone) === barePhone(phone) || (digitsOnly(c.phone).slice(-9) === digitsOnly(phone).slice(-9) && digitsOnly(phone).length >= 9))) {
+    err.textContent = 'Este número ya tiene cuenta. Inicia sesión.';
+    err.style.display='block'; return;
+  }
 
   // FIX: nuevo cliente siempre debe aceptar las normas aunque no hayan cambiado desde su registro
-  const newClient = { id: uid(), name, phone, pin: pinHash, totalCuts:0, pendingFine:false, fineAmount:0, cutHistory:[], normasAckVersion: null, blocked:false };
+  // Se guarda el número tal como está en la lista del barbero (para coincidencia exacta lo es
+  // igual que antes): el resto de búsquedas por normalizePhone() siguen encontrándolo.
+  const _regPhone = normalizePhone(typeof allowed === 'object' ? allowed.phone : allowed);
+  const newClient = { id: uid(), name, phone: _regPhone, pin: pinHash, totalCuts:0, pendingFine:false, fineAmount:0, cutHistory:[], normasAckVersion: null, blocked:false };
   APP.db.clients.push(newClient);
   saveDB();
   showToast('Cuenta creada ✂️', 'success');
@@ -4029,11 +4189,11 @@ function renderHome() {
           ${myAppts.map((appt, i) => `<div class="carousel-slide" id="slide_${i}" style="display:${i===0?'block':'none'}">${buildApptCard(appt, i===0)}</div>`).join('')}
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px;padding:0 4px">
-          <button class="cal-nav-btn" onclick="carouselNav(-1)" style="width:36px;height:36px">‹</button>
+          <button class="cal-nav-btn" onclick="carouselNav(-1)" style="width:36px;height:36px" aria-label="Cita anterior">‹</button>
           <div id="carouselDots" style="display:flex;gap:6px">
             ${myAppts.map((_,i)=>`<div class="carousel-dot" id="dot_${i}" style="width:8px;height:8px;border-radius:50%;background:${i===0?'var(--gold)':'var(--border2)'}"></div>`).join('')}
           </div>
-          <button class="cal-nav-btn" onclick="carouselNav(1)" style="width:36px;height:36px">›</button>
+          <button class="cal-nav-btn" onclick="carouselNav(1)" style="width:36px;height:36px" aria-label="Cita siguiente">›</button>
         </div>
       </div>`;
     }
@@ -4125,6 +4285,11 @@ function renderBookStep() {
   c.innerHTML = html;
 }
 
+// FIX accesibilidad: días, horas y flechas de los calendarios son <div> con onclick, sin foco ni
+// teclado (no se podía reservar sin pantalla táctil/ratón). Mismo patrón que ya usan nav-item,
+// login-tab, etc.
+const _KBD_BTN = ` role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}"`;
+
 function renderCalendar() {
   const now = new Date();
   const y = bookState.calYear, m = bookState.calMonth;
@@ -4138,9 +4303,9 @@ function renderCalendar() {
   const maxDate = new Date(now); maxDate.setDate(now.getDate()+21);
 
   let html = `<div class="cal-nav">
-    <div class="cal-nav-btn" onclick="calNav(-1)">‹</div>
+    <div class="cal-nav-btn" onclick="calNav(-1)"${_KBD_BTN} aria-label="Mes anterior">‹</div>
     <div class="cal-month">${months[m].toUpperCase()} ${y}</div>
-    <div class="cal-nav-btn" onclick="calNav(1)">›</div>
+    <div class="cal-nav-btn" onclick="calNav(1)"${_KBD_BTN} aria-label="Mes siguiente">›</div>
   </div>
   <div class="calendar-grid">`;
   days.forEach(d => html += `<div class="cal-header">${d}</div>`);
@@ -4180,7 +4345,7 @@ function renderCalendar() {
       if (!isClickable) {
         html += `<div class="${cls}" style="position:relative;">${d}${dot}</div>`;
       } else {
-        html += `<div class="${cls}" style="position:relative;${blockedStyle}" onclick="selectDate('${dateStr}')">${d}${dot}</div>`;
+        html += `<div class="${cls}" style="position:relative;${blockedStyle}" onclick="selectDate('${dateStr}')"${_KBD_BTN}>${d}${dot}</div>`;
       }
     } else {
       // Client: booking window restriction
@@ -4194,7 +4359,7 @@ function renderCalendar() {
         if (a.clientId !== clientId || !['pending','confirmed'].includes(a.status)) return false;
         const apptD = parseDate(a.date);
         const curD = date;
-        const diff = Math.abs((curD - apptD) / 86400000);
+        const diff = Math.abs(Math.round((curD - apptD) / 86400000));
         return diff <= 4;
       });
       let cls = 'cal-day';
@@ -4204,7 +4369,7 @@ function renderCalendar() {
       if (bookState.date === dateStr) cls += ' selected';
       if (hasMyAppt) cls += ' has-appt';
       if (hasMyAppt) {
-        html += `<div class="${cls}" style="opacity:1" onclick="selectDate('${dateStr}')">${d}</div>`;
+        html += `<div class="${cls}" style="opacity:1" onclick="selectDate('${dateStr}')"${_KBD_BTN}>${d}</div>`;
       } else if (!isMin || !isMax || !isWorkday || blockedByAppt || isBlockedDay) {
         // FIX: show a tooltip so the client knows why the day is blocked
         const _reason = isBlockedDay ? 'Barbería cerrada' : blockedByAppt ? 'Tienes una cita próxima' : !isWorkday ? 'Día no laborable' : !isMin ? 'Reserva con al menos 2 días de antelación' : 'Fuera del período de reserva';
@@ -4212,7 +4377,7 @@ function renderCalendar() {
         const _blockedDot = isBlockedDay ? '<span style="position:absolute;bottom:3px;left:50%;transform:translateX(-50%);font-size:0.6rem;line-height:1">🚫</span>' : '';
         html += `<div class="${cls}" style="position:relative;${_blockedStyle}" title="${_reason}">${d}${_blockedDot}</div>`;
       } else {
-        html += `<div class="${cls}" onclick="selectDate('${dateStr}')">${d}</div>`;
+        html += `<div class="${cls}" onclick="selectDate('${dateStr}')"${_KBD_BTN}>${d}</div>`;
       }
     }
   }
@@ -4270,8 +4435,13 @@ function renderCalendar() {
       // bookedBase = precio del corte solo (sin multa)
       const baseFromBooked = bookedPrice != null ? bookedPrice : null;
       const baseFromNote = _extractPriceFromNote(note);
+      // FIX: los cortes archivados (cutHistory) no guardan bookedPrice, pero sí amountPaid, que
+      // es el precio del corte cobrado (la app nunca suma la multa ahí). Antes se saltaba a
+      // getEffectivePrice() — el precio ACTUAL — y, tras un cambio de precio, el corte pasado se
+      // contaba con el precio nuevo (subida → ganancia inflada; bajada → diferencia como "multa").
       const basePrice = baseFromBooked != null ? baseFromBooked
                       : baseFromNote != null ? baseFromNote
+                      : amountPaid != null ? amountPaid
                       : isOOH ? (getEffectivePrice(apptDate) + 5) : getEffectivePrice(apptDate);
       const totalPaid = amountPaid != null ? amountPaid : basePrice;
       const fineInCut = Math.max(0, totalPaid - basePrice);
@@ -4287,7 +4457,7 @@ function renderCalendar() {
       if (bd.isOOH) { earnedOOH += bd.basePrice; countOOH++; oohDetails.push({name:_name, date:a.date, time:a.time, amount:bd.basePrice}); }
       else { earnedNormal += bd.basePrice; countNormal++; normalDetails.push({name:_name, date:a.date, time:a.time, amount:bd.basePrice}); }
       earnedFines += bd.fineInCut;
-      if (bd.fineInCut > 0) finesDetails.push({name:_name, date:a.date, time:a.time, amount:bd.fineInCut});
+      if (bd.fineInCut > 0) finesDetails.push({name:_name, date:a.date, time:a.time, amount:bd.fineInCut, clientId:a.clientId});
     });
     archivedCutsThisMonth.forEach(h => {
       const isOOH = h.note && h.note.includes('Fuera de horario');
@@ -4298,7 +4468,7 @@ function renderCalendar() {
       if (bd.isOOH) { earnedOOH += bd.basePrice; countOOH++; oohDetails.push({name:_name, date:h.date, time:h.time, amount:bd.basePrice}); }
       else { earnedNormal += bd.basePrice; countNormal++; normalDetails.push({name:_name, date:h.date, time:h.time, amount:bd.basePrice}); }
       earnedFines += bd.fineInCut;
-      if (bd.fineInCut > 0) finesDetails.push({name:_name, date:h.date, time:h.time, amount:bd.fineInCut});
+      if (bd.fineInCut > 0) finesDetails.push({name:_name, date:h.date, time:h.time, amount:bd.fineInCut, clientId:h.clientId});
     });
 
     // Sumar multas pagadas de forma independiente (no ligadas a un corte) este mes
@@ -4454,12 +4624,12 @@ function renderAdminAgenda() {
     : '';
 
   let html = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-    <button class="cal-nav-btn" style="width:40px;height:40px;font-size:1.1rem" onclick="adminNavDay(-1)">‹</button>
+    <button class="cal-nav-btn" style="width:40px;height:40px;font-size:1.1rem" onclick="adminNavDay(-1)" aria-label="Día anterior">‹</button>
     <div style="text-align:center">
       <div style="font-size:0.65rem;color:var(--gold);font-family:'Courier New',monospace;letter-spacing:0.15em">${weekDays[date.getDay()].toUpperCase()}</div>
       <div style="font-family:Georgia,serif;font-size:1.2rem;font-weight:700;display:flex;align-items:center;justify-content:center">${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}${dayBadge}</div>
     </div>
-    <button class="cal-nav-btn" style="width:40px;height:40px;font-size:1.1rem" onclick="adminNavDay(1)">›</button>
+    <button class="cal-nav-btn" style="width:40px;height:40px;font-size:1.1rem" onclick="adminNavDay(1)" aria-label="Día siguiente">›</button>
   </div>`;
 
   if (slots.length === 0) {
@@ -4937,6 +5107,7 @@ function addWaitlist(date) {
 }
 
 function removeWaitlist(date) {
+  if (APP._adminSession) { showToast('Modo vista — no puedes realizar esta acción', 'info'); return; }
   APP.db.cancelWaitlist = (APP.db.cancelWaitlist||[]).filter(w => !(w.clientId === APP.currentUser.id && w.date === date));
   saveDB();
   showToast('Aviso cancelado', 'info');
@@ -5001,12 +5172,12 @@ function confirmSwapRequest(targetApptId, myApptId, swapNote) {
   // Notify target client
   const _myCl = APP.db.clients.find(c => c.id === myAppt.clientId);
   const _myAdminName = getAdminName(myAppt.clientId, _myCl ? _myCl.phone : '') || APP.currentUser.name;
-  const noteHtml = swapNote ? `<div style="margin:8px 0;background:var(--bg3);border-left:3px solid var(--gold);border-radius:6px;padding:8px 12px;font-size:0.82rem;color:var(--text2);text-align:left">💬 "${escHtml(swapNote)}"</div>` : '';
-  addNotif(targetAppt.clientId, `⇄ <strong>${escHtml(_myAdminName)}</strong> quiere intercambiar su hora contigo el ${formatDateHuman(myAppt.date)}:<br><div style="margin:10px 0;display:flex;align-items:center;justify-content:center;gap:10px"><div style="background:var(--bg3);border:1px solid var(--red);border-radius:8px;padding:8px 14px;text-align:center"><div style="font-size:0.65rem;color:var(--red);letter-spacing:0.1em">SU HORA</div><div style="font-size:1.2rem;font-weight:700;font-family:'Courier New',monospace;color:var(--text)">${myAppt.time}</div></div><div style="font-size:1.3rem">⇄</div><div style="background:var(--bg3);border:1px solid var(--green);border-radius:8px;padding:8px 14px;text-align:center"><div style="font-size:0.65rem;color:var(--green);letter-spacing:0.1em">TU HORA</div><div style="font-size:1.2rem;font-weight:700;font-family:'Courier New',monospace;color:var(--text)">${targetAppt.time}</div></div></div>${noteHtml}Si aceptas, tú pasarás a las <strong>${myAppt.time}</strong> y él a las <strong>${targetAppt.time}</strong>. Si no respondes o rechazas, cada uno mantiene su hora.`, 'swap', req.id);
+  const noteHtml = swapNote ? `<div style="margin:8px 0;background:var(--bg3);border-left:3px solid var(--gold);border-radius:6px;padding:8px 12px;font-size:0.82rem;color:var(--text2);text-align:left">💬 "${swapNote}"</div>` : '';
+  addNotif(targetAppt.clientId, `⇄ <strong>${_myAdminName}</strong> quiere intercambiar su hora contigo el ${formatDateHuman(myAppt.date)}:<br><div style="margin:10px 0;display:flex;align-items:center;justify-content:center;gap:10px"><div style="background:var(--bg3);border:1px solid var(--red);border-radius:8px;padding:8px 14px;text-align:center"><div style="font-size:0.65rem;color:var(--red);letter-spacing:0.1em">SU HORA</div><div style="font-size:1.2rem;font-weight:700;font-family:'Courier New',monospace;color:var(--text)">${myAppt.time}</div></div><div style="font-size:1.3rem">⇄</div><div style="background:var(--bg3);border:1px solid var(--green);border-radius:8px;padding:8px 14px;text-align:center"><div style="font-size:0.65rem;color:var(--green);letter-spacing:0.1em">TU HORA</div><div style="font-size:1.2rem;font-weight:700;font-family:'Courier New',monospace;color:var(--text)">${targetAppt.time}</div></div></div>${noteHtml}Si aceptas, tú pasarás a las <strong>${myAppt.time}</strong> y él a las <strong>${targetAppt.time}</strong>. Si no respondes o rechazas, cada uno mantiene su hora.`, 'swap', req.id);
   // Notify admin
   const _targetCl = APP.db.clients.find(c => c.id === targetAppt.clientId);
   const _targetAdminName = getAdminName(targetAppt.clientId, _targetCl ? _targetCl.phone : '') || targetAppt.clientName;
-  addNotif('admin', `⇄ <strong>${escHtml(_myAdminName)}</strong> ha solicitado cambiar su hora (${myAppt.time}) con <strong>${escHtml(_targetAdminName)}</strong> (${targetAppt.time}) el ${formatDateHuman(myAppt.date)}.`);
+  addNotif('admin', `⇄ <strong>${_myAdminName}</strong> ha solicitado cambiar su hora (${myAppt.time}) con <strong>${_targetAdminName}</strong> (${targetAppt.time}) el ${formatDateHuman(myAppt.date)}.`);
   // Auto-reject after 2h if no response
   saveDB();
   showToast('Solicitud enviada. El cliente será notificado.', 'info');
@@ -5119,7 +5290,7 @@ function renderTimeSlots() {
     if (!hasMyApptThisDay) {
       const blocked = APP.db.appointments.some(a => {
         if (a.clientId !== clientId || !['pending','confirmed'].includes(a.status)) return false;
-        const diff = Math.abs((parseDate(bookState.date) - parseDate(a.date)) / 86400000);
+        const diff = Math.abs(Math.round((parseDate(bookState.date) - parseDate(a.date)) / 86400000));
         return diff <= 4;
       });
       if (blocked) {
@@ -5134,12 +5305,12 @@ function renderTimeSlots() {
   const nextDate = getAdjacentDate(bookState.date, 1);
 
   let html = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:8px">
-    <button class="cal-nav-btn" style="width:40px;height:40px;flex-shrink:0;font-size:1.1rem${!prevDate ? ';opacity:0.3;cursor:not-allowed' : ''}" onclick="${prevDate ? `selectDate('${prevDate}')` : ''}" ${!prevDate ? 'disabled' : ''}>‹</button>
+    <button class="cal-nav-btn" style="width:40px;height:40px;flex-shrink:0;font-size:1.1rem${!prevDate ? ';opacity:0.3;cursor:not-allowed' : ''}" onclick="${prevDate ? `selectDate('${prevDate}')` : ''}" ${!prevDate ? 'disabled' : ''} aria-label="Día anterior">‹</button>
     <div style="text-align:center;flex:1">
       <div class="section-label" style="margin-bottom:2px">Fecha seleccionada</div>
       <div style="font-family:Georgia,serif;font-size:1.25rem;font-weight:700">${formatDateHuman(bookState.date)}</div>
     </div>
-    <button class="cal-nav-btn" style="width:40px;height:40px;flex-shrink:0;font-size:1.1rem${!nextDate ? ';opacity:0.3;cursor:not-allowed' : ''}" onclick="${nextDate ? `selectDate('${nextDate}')` : ''}" ${!nextDate ? 'disabled' : ''}>›</button>
+    <button class="cal-nav-btn" style="width:40px;height:40px;flex-shrink:0;font-size:1.1rem${!nextDate ? ';opacity:0.3;cursor:not-allowed' : ''}" onclick="${nextDate ? `selectDate('${nextDate}')` : ''}" ${!nextDate ? 'disabled' : ''} aria-label="Día siguiente">›</button>
   </div>
   <div class="section-label">Elige un horario</div>
   <div class="time-grid">`;
@@ -5297,7 +5468,7 @@ function renderTimeSlots() {
         </div>`;
       } else {
         // No pending swap - show swap button
-        html += `<div class="time-slot taken" style="cursor:pointer;border:1px solid var(--blue);background:rgba(59,130,246,0.12);text-decoration:none" onclick="requestSwap('${bookState.date}','${s}','${ownerAppt.id}','${myApptToday.id}')">
+        html += `<div class="time-slot taken" style="cursor:pointer;border:1px solid var(--blue);background:rgba(59,130,246,0.12);text-decoration:none" onclick="requestSwap('${bookState.date}','${s}','${ownerAppt.id}','${myApptToday.id}')"${_KBD_BTN}>
           ${s}
           <span style="display:block;font-size:0.5rem;color:var(--text3);margin-top:1px;letter-spacing:0.04em">OCUPADA</span>
           <span style="display:block;font-size:0.58rem;color:#60a5fa;margin-top:2px;font-weight:700;letter-spacing:0.04em">⇄ PEDIR CAMBIO</span>
@@ -5322,7 +5493,7 @@ function renderTimeSlots() {
             <span style="display:block;font-size:0.5rem;color:var(--text3);margin-top:2px;letter-spacing:0.05em">LIBRE</span>
           </div>`;
         } else {
-          html += `<div class="${cls}" onclick="selectTime('${s}')" style="position:relative">
+          html += `<div class="${cls}" onclick="selectTime('${s}')" style="position:relative"${_KBD_BTN}>
             ${s}
             ${isPreferred && !myApptToday ? `<span style="display:block;font-size:0.55rem;color:${bookState.time === s ? '#0a0a0a' : 'var(--gold)'};margin-top:2px;letter-spacing:0.05em">⭐ IDEAL</span>` : ''}
           </div>`;
@@ -5515,7 +5686,8 @@ function _waitBookingSaved(apptId) {
     if (!_isPending()) {
       clearInterval(iv);
       if (modalOpen && (box || document.getElementById('_bookSlowBox'))) closeModal();
-      showToast('✓ Cita confirmada', 'success');
+      if (_lostBookingIds.has(apptId)) showToast('⚠️ Tu reserva no se ha guardado: esa hora (o ese día) ya se había reservado desde otro dispositivo. Elige otra hora.', 'error');
+      else showToast('✓ Cita confirmada', 'success');
       if (APP.currentPage === 'home') navigate('home');
       return;
     }
@@ -5570,9 +5742,9 @@ function renderOOHModal() {
   </div>
   <div class="section-label">Día preferido</div>
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-    <div class="cal-nav-btn" onclick="oohCalNav(-1)">‹</div>
+    <div class="cal-nav-btn" onclick="oohCalNav(-1)"${_KBD_BTN} aria-label="Mes anterior">‹</div>
     <div style="font-weight:700;font-size:1rem;letter-spacing:0.05em">${months[m].toUpperCase()} ${y}</div>
-    <div class="cal-nav-btn" onclick="oohCalNav(1)">›</div>
+    <div class="cal-nav-btn" onclick="oohCalNav(1)"${_KBD_BTN} aria-label="Mes siguiente">›</div>
   </div>
   <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;margin-bottom:14px">`;
   days.forEach(d => calHtml += `<div style="text-align:center;font-size:0.7rem;color:var(--text3);padding:3px 0;font-weight:600">${d}</div>`);
@@ -5589,7 +5761,7 @@ function renderOOHModal() {
     else if (!inRange) style += 'color:var(--border2);cursor:not-allowed;';
     else style += 'color:var(--text2);';
     if (inRange) {
-      calHtml += `<div style="${style}" onclick="oohSelectDate('${dateStr}')">${d}</div>`;
+      calHtml += `<div style="${style}" onclick="oohSelectDate('${dateStr}')"${_KBD_BTN}>${d}</div>`;
     } else {
       calHtml += `<div style="${style}">${d}</div>`;
     }
@@ -5814,12 +5986,12 @@ function apptCard(a, isPast=false) {
   let actions = '';
   if (!isPast && APP.isAdmin && !['done','late','no-show'].includes(a.status)) {
     actions = `<div class="appt-actions">
-      <div class="appt-btn" title="Añadir al calendario" style="${isCalendarAdded(a.id)?'color:var(--text3);border-color:var(--border);opacity:0.5':'color:var(--gold);border-color:var(--gold)'}" onclick="(function(btn){var ap=APP.db.appointments.find(function(x){return x.id==='${a.id}'});addToCalendar(ap,btn);})(this)">📅</div>
-      <div class="appt-btn" title="Cancelar" onclick="cancelAppt('${a.id}')">✕</div>
-      <div class="appt-btn green" title="Marcar realizada" onclick="doneAppt('${a.id}')">✓</div>
+      <div class="appt-btn" title="Añadir al calendario" style="${isCalendarAdded(a.id)?'color:var(--text3);border-color:var(--border);opacity:0.5':'color:var(--gold);border-color:var(--gold)'}" onclick="(function(btn){var ap=APP.db.appointments.find(function(x){return x.id==='${a.id}'});addToCalendar(ap,btn);})(this)"${_KBD_BTN}>📅</div>
+      <div class="appt-btn" title="Cancelar" onclick="cancelAppt('${a.id}')"${_KBD_BTN}>✕</div>
+      <div class="appt-btn green" title="Marcar realizada" onclick="doneAppt('${a.id}')"${_KBD_BTN}>✓</div>
     </div>`;
   } else if (!isPast && !APP.isAdmin && ['pending','confirmed'].includes(a.status)) {
-    actions = `<div class="appt-actions"><div class="appt-btn" title="Añadir al calendario" style="${isCalendarAdded(a.id)?'color:var(--text3);border-color:var(--border);opacity:0.5':'color:var(--gold);border-color:var(--gold)'}" onclick="clientAddToCalendar('${a.id}')">📅</div><div class="appt-btn" title="Cancelar" onclick="cancelAppt('${a.id}')">✕</div></div>`;
+    actions = `<div class="appt-actions"><div class="appt-btn" title="Añadir al calendario" style="${isCalendarAdded(a.id)?'color:var(--text3);border-color:var(--border);opacity:0.5':'color:var(--gold);border-color:var(--gold)'}" onclick="clientAddToCalendar('${a.id}')"${_KBD_BTN}>📅</div><div class="appt-btn" title="Cancelar" onclick="cancelAppt('${a.id}')"${_KBD_BTN}>✕</div></div>`;
   }
   return `<div class="appt-item">
     <div class="appt-date-block" style="${isToday ? 'border-color:var(--blue);background:rgba(82,149,224,0.06)' : isTomorrow ? 'border-color:var(--gold);background:rgba(201,168,76,0.06)' : ''}">
@@ -6592,10 +6764,10 @@ function manualAddCutStep3(date, time, isPast, isOOH) {
   const listHtml = clients.map(c => {
     const name = getAdminName(c.id, c.phone) || c.name;
     const initials = name.split(' ').map(n=>n[0]||'').join('').slice(0,2).toUpperCase();
-    return `<div class="manual-cut-client-row" data-name="${escHtml(name.toLowerCase())}" onclick="closeModal();manualAddCutStep4('${date}','${time}','${c.id}',${isPast},${isOOH})"
+    return `<div class="manual-cut-client-row" data-name="${escHtml(name.toLowerCase())}" data-phone="${escHtml(digitsOnly(c.phone))}" onclick="closeModal();manualAddCutStep4('${date}','${time}','${c.id}',${isPast},${isOOH})"${_KBD_BTN}
       style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;cursor:pointer;transition:border-color 0.2s"
       onmouseover="this.style.borderColor='var(--gold)'" onmouseout="this.style.borderColor='var(--border)'">
-      <div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.8rem;flex-shrink:0">${initials}</div>
+      <div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.8rem;flex-shrink:0">${escHtml(initials)}</div>
       <div style="flex:1">
         <div style="font-weight:600;font-size:0.9rem">${escHtml(name)}</div>
         <div style="font-size:0.75rem;color:var(--text3);font-family:'Courier New',monospace">${escHtml(c.phone)}</div>
@@ -6609,7 +6781,8 @@ function manualAddCutStep3(date, time, isPast, isOOH) {
       oninput="(function(q){
         var rows=document.querySelectorAll('#manualCutClientList .manual-cut-client-row');
         var vis=0;
-        rows.forEach(function(el){ var show=el.dataset.name.includes(q.toLowerCase()); el.style.display=show?'':'none'; if(show)vis++; });
+        var qd=q.replace(/[^0-9]/g,'');
+        rows.forEach(function(el){ var show=el.dataset.name.includes(q.toLowerCase()) || (qd.length>0 && (el.dataset.phone||'').includes(qd)); el.style.display=show?'':'none'; if(show)vis++; });
         var ct=document.getElementById('manualCutClientCount'); if(ct) ct.textContent=vis+' cliente'+(vis!==1?'s':'');
       })(this.value.toLowerCase())">
     <div id="manualCutClientCount" style="font-size:0.7rem;color:var(--text3);font-family:'Courier New',monospace;margin-bottom:8px;text-align:right">${clients.length} cliente${clients.length!==1?'s':''}</div>
@@ -6688,6 +6861,7 @@ function confirmManualAddCut(date, time, clientId, isPast, isOOH) {
 // =============================================
 function renderProfile() {
   const u = APP.currentUser;
+  setTimeout(_updatePushStatusUI, 0); // rellena #pushStatus una vez pintado el perfil
   const initials = u.name.split(' ').map(n=>n[0]||'').filter(Boolean).join('').slice(0,2).toUpperCase();
 
   // ADMIN: show fines management panel
@@ -6712,7 +6886,7 @@ function renderProfile() {
             <span class="pill pill-red" style="margin-top:4px;display:inline-flex">Multa pendiente</span>
           </div>
           <div class="appt-actions">
-            <div class="appt-btn green" title="Perdonar multa" onclick="clearFineFromProfile('${c.id}')">✓</div>
+            <div class="appt-btn green" title="Perdonar multa" onclick="clearFineFromProfile('${c.id}')"${_KBD_BTN}>✓</div>
           </div>
         </div>`;
       });
@@ -6729,7 +6903,7 @@ function renderProfile() {
       + APP.db.appointments.filter(a=>['done','late'].includes(a.status) && !archivedIds.has(a.id)).length;
 
     return `<div class="profile-header">
-      <div class="avatar">${initials}</div>
+      <div class="avatar">${escHtml(initials)}</div>
       <div class="profile-name">✂️ ${escHtml(u.name)}</div>
       <div class="profile-phone">${escHtml(u.phone)}</div>
       <div style="margin-top:6px"><span class="pill pill-gold">BARBERO</span></div>
@@ -6749,11 +6923,8 @@ function renderProfile() {
 
     <div style="margin-top:20px">
       <button class="btn btn-ghost" onclick="logout()">Cerrar sesión</button>
+      <div id="pushStatus" style="margin-top:8px"></div>
       <button class="btn btn-ghost" style="margin-top:8px;border-color:var(--gold);color:var(--gold)" onclick="registerPush()">🔔 Activar notificaciones push</button>
-      <div style="display:flex;gap:8px;margin-top:8px">
-        <button class="btn btn-ghost btn-sm" style="flex:1;border-color:var(--blue);color:var(--blue)" onclick="exportData()">📤 Exportar datos</button>
-        <button class="btn btn-ghost btn-sm" style="flex:1;border-color:var(--gold);color:var(--gold)" onclick="importDataPrompt()">📥 Importar datos</button>
-      </div>
       <button class="btn btn-ghost" style="margin-top:8px;border-color:var(--red);color:var(--red)" onclick="confirmResetAll()">🗑️ Borrar todos los datos</button>
     </div>`;
   }
@@ -6769,7 +6940,7 @@ function renderProfile() {
   const upcomingCount = myAppts.filter(a => a.date >= todayStr() && ['pending','confirmed'].includes(a.status)).length;
 
   return `<div class="profile-header">
-    <div class="avatar">${initials}</div>
+    <div class="avatar">${escHtml(initials)}</div>
     <div class="profile-name">${escHtml(u.name)}</div>
     <div class="profile-phone">${escHtml(u.phone)}</div>
   </div>
@@ -6806,6 +6977,7 @@ function renderProfile() {
 
   <div style="margin-top:4px">
     <button class="btn btn-ghost" onclick="logout()">Cerrar sesión</button>
+    <div id="pushStatus" style="margin-top:8px"></div>
     <button class="btn btn-ghost" style="margin-top:8px;border-color:var(--gold);color:var(--gold)" onclick="registerPush()">🔔 Activar notificaciones push</button>
   </div>
 
@@ -6872,9 +7044,9 @@ function renderCutsCalendar(container) {
   const dayLabels = ['L','M','X','J','V','S','D'];
 
   let html = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-    <button onclick="cutsCalMove(-1)" style="background:none;border:none;cursor:${canGoPrev?'pointer':'default'};font-size:1.2rem;color:${canGoPrev?'var(--gold)':'var(--text3)'};padding:0 6px;opacity:${canGoPrev?'1':'0.3'}" ${canGoPrev?'':'disabled'}>&#8249;</button>
+    <button onclick="cutsCalMove(-1)" style="background:none;border:none;cursor:${canGoPrev?'pointer':'default'};font-size:1.2rem;color:${canGoPrev?'var(--gold)':'var(--text3)'};padding:0 6px;opacity:${canGoPrev?'1':'0.3'}" ${canGoPrev?'':'disabled'} aria-label="Mes anterior">&#8249;</button>
     <div style="font-weight:700;font-size:0.9rem;color:var(--gold);letter-spacing:0.08em">${monthNames[m].toUpperCase()} ${y}</div>
-    <button onclick="cutsCalMove(1)" style="background:none;border:none;cursor:${canGoNext?'pointer':'default'};font-size:1.2rem;color:${canGoNext?'var(--gold)':'var(--text3)'};padding:0 6px;opacity:${canGoNext?'1':'0.3'}" ${canGoNext?'':'disabled'}>&#8250;</button>
+    <button onclick="cutsCalMove(1)" style="background:none;border:none;cursor:${canGoNext?'pointer':'default'};font-size:1.2rem;color:${canGoNext?'var(--gold)':'var(--text3)'};padding:0 6px;opacity:${canGoNext?'1':'0.3'}" ${canGoNext?'':'disabled'} aria-label="Mes siguiente">&#8250;</button>
   </div>
   <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px">`;
 
@@ -7159,7 +7331,7 @@ function renderClientList(filter, sortMode) {
       ? `<div style="font-size:0.7rem;color:var(--green);font-family:'Courier New',monospace;margin-top:2px">✂️ ${formatDateHuman(lastCut.date)}</div>`
       : `<div style="font-size:0.7rem;color:var(--text3);font-family:'Courier New',monospace;margin-top:2px">Sin cortes aún</div>`;
     html += `<div class="client-item">
-      <div class="client-avatar">${initials}</div>
+      <div class="client-avatar">${escHtml(initials)}</div>
       <div class="client-info">
         <div class="client-name">${escHtml(displayName)} ${c.blocked?`<span class="pending-badge">🚫 Bloqueado</span>`:''} ${c.pendingFine?`<span class="pending-badge">Multa ${c.fineAmount}€</span>`:''}</div>
         <div class="client-phone">${escHtml(c.phone)}</div>
@@ -7184,15 +7356,15 @@ function renderClientList(filter, sortMode) {
     if (q && !adminName.toLowerCase().includes(q) && !phone.includes(q) && !(qDigits2.length > 0 && digitsOnly(phone).includes(qDigits2))) return;
     const initials = adminName ? adminName.split(' ').map(n=>n[0]||'').filter(Boolean).join('').slice(0,2).toUpperCase() : '?';
     html += `<div class="client-item" style="opacity:0.7">
-      <div class="client-avatar" style="${adminName ? '' : 'color:var(--text3)'}">${initials}</div>
+      <div class="client-avatar" style="${adminName ? '' : 'color:var(--text3)'}">${escHtml(initials)}</div>
       <div class="client-info">
         <div class="client-name">${adminName ? escHtml(adminName) : '<span style="color:var(--text3);font-style:italic">Sin nombre</span>'}</div>
         <div class="client-phone">${escHtml(phone)}<br><span style="font-size:0.7rem;color:var(--text3)">(sin registrar)</span></div>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
         <span class="pill pill-gray">Pendiente</span>
-        <div class="appt-btn" title="Editar nombre" data-phone="${escHtml(phone)}" onclick="editAllowedName(this.dataset.phone)" style="font-size:0.8rem">✏️</div>
-        <div class="client-del" data-phone="${escHtml(phone)}" onclick="removeAllowedPhone(this.dataset.phone)">✕</div>
+        <div class="appt-btn" title="Editar nombre" data-phone="${escHtml(phone)}" onclick="editAllowedName(this.dataset.phone)" style="font-size:0.8rem"${_KBD_BTN}>✏️</div>
+        <div class="client-del" data-phone="${escHtml(phone)}" onclick="removeAllowedPhone(this.dataset.phone)" title="Eliminar número"${_KBD_BTN}>✕</div>
       </div>
     </div>`;
   });
@@ -7430,7 +7602,7 @@ function removeAllowedPhone(phoneKey) {
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn btn-ghost" style="flex:1" onclick="closeModal();openClientsModal()">No</button>
-      <button class="btn btn-red" style="flex:1" onclick="closeModal();confirmRemovePhone('${escHtml(_capturedPhone)}')">Sí, eliminar</button>
+      <button class="btn btn-red" style="flex:1" onclick="closeModal();confirmRemovePhone('${escHtml(String(_capturedPhone).replace(/\\/g, '\\\\').replace(/'/g, "\\'"))}')">Sí, eliminar</button>
     </div>
   `);
 }
@@ -7649,14 +7821,14 @@ function doToggleBlockClient(clientId) {
       addNotif(c.id, `🚫 Tu cita del ${formatDateHuman(appt.date)} a las ${appt.time} ha sido <strong>cancelada</strong> porque tu cuenta ha sido bloqueada.`, 'cancel');
     });
     if (cancelledAppts.length) {
-      addNotif('admin', `🚫 Has bloqueado a <strong>${escHtml(name)}</strong> y se ${cancelledAppts.length > 1 ? 'han cancelado' : 'ha cancelado'} ${cancelledAppts.length} cita${cancelledAppts.length > 1 ? 's' : ''}.`, 'cancel');
+      addNotif('admin', `🚫 Has bloqueado a <strong>${name}</strong> y se ${cancelledAppts.length > 1 ? 'han cancelado' : 'ha cancelado'} ${cancelledAppts.length} cita${cancelledAppts.length > 1 ? 's' : ''}.`, 'cancel');
     } else {
-      addNotif('admin', `🚫 Has bloqueado a <strong>${escHtml(name)}</strong>.`, 'cancel');
+      addNotif('admin', `🚫 Has bloqueado a <strong>${name}</strong>.`, 'cancel');
     }
     addNotif(c.id, '🚫 Tu cuenta ha sido bloqueada.');
   } else {
     addNotif(c.id, '✅ Tu cuenta ha sido desbloqueada. Ya puedes volver a reservar citas.');
-    addNotif('admin', `✅ Has desbloqueado a <strong>${escHtml(name)}</strong>.`, 'cancel');
+    addNotif('admin', `✅ Has desbloqueado a <strong>${name}</strong>.`, 'cancel');
   }
 
   saveDB();
@@ -7899,7 +8071,7 @@ function openSelectClientForTip() {
       ? filtered.map(c => {
           const name = escHtml(getAdminName(c.id, c.phone) || c.name);
           return `<div style="padding:10px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:0.88rem;font-weight:600;color:var(--text)"
-            onclick="_selectClientForTip('${c.id}')">${name}</div>`;
+            onclick="_selectClientForTip('${c.id}')"${_KBD_BTN}>${name}</div>`;
         }).join('')
       : '<div style="text-align:center;color:var(--text3);font-size:0.85rem;padding:16px">Sin resultados</div>';
   };
@@ -8015,10 +8187,10 @@ function openSelectClientForFine() {
   const listHtml = clients.map(c => {
     const name = getAdminName(c.id, c.phone) || c.name;
     const initials = name.split(' ').map(n=>n[0]||'').join('').slice(0,2).toUpperCase();
-    return `<div class="reg-fine-client-row" data-name="${escHtml(name.toLowerCase())}" onclick="_selectClientForFine('${c.id}')"
+    return `<div class="reg-fine-client-row" data-name="${escHtml(name.toLowerCase())}" onclick="_selectClientForFine('${c.id}')"${_KBD_BTN}
       style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;cursor:pointer;transition:border-color 0.2s"
       onmouseover="this.style.borderColor='var(--gold)'" onmouseout="this.style.borderColor='var(--border)'">
-      <div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.8rem;flex-shrink:0">${initials}</div>
+      <div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.8rem;flex-shrink:0">${escHtml(initials)}</div>
       <div style="flex:1">
         <div style="font-weight:600;font-size:0.9rem">${escHtml(name)}</div>
         <div style="font-size:0.75rem;color:var(--text3);font-family:'Courier New',monospace">${escHtml(c.phone)}</div>
@@ -8064,10 +8236,10 @@ function openAddFineModal() {
     const name = getAdminName(c.id, c.phone) || c.name;
     const initials = name.split(' ').map(n=>n[0]||'').join('').slice(0,2).toUpperCase();
     const fineTag = (c.pendingFine && c.fineAmount) ? `<span class="pill pill-red" style="font-size:0.65rem;padding:1px 6px;margin-left:6px">${c.fineAmount}€</span>` : '';
-    return `<div class="fine-client-row" data-name="${escHtml(name.toLowerCase())}" onclick="closeModal();applyManualFine('${c.id}')"
+    return `<div class="fine-client-row" data-name="${escHtml(name.toLowerCase())}" onclick="closeModal();applyManualFine('${c.id}')"${_KBD_BTN}
       style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;cursor:pointer;transition:border-color 0.2s"
       onmouseover="this.style.borderColor='var(--red)'" onmouseout="this.style.borderColor='var(--border)'">
-      <div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.8rem;flex-shrink:0">${initials}</div>
+      <div style="width:36px;height:36px;border-radius:50%;background:var(--bg2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.8rem;flex-shrink:0">${escHtml(initials)}</div>
       <div style="flex:1">
         <div style="font-weight:600;font-size:0.9rem">${escHtml(name)}${fineTag}</div>
         <div style="font-size:0.75rem;color:var(--text3);font-family:'Courier New',monospace">${escHtml(c.phone)}</div>
@@ -8120,7 +8292,6 @@ function confirmApplyManualFine(clientId, amount) {
   addNotif(clientId, `⚠️ Se te ha aplicado una multa de <strong>+${amount}€</strong> que se cobrará en tu próximo corte.`, 'cancel');
   saveDB();
   showToast(`Multa de ${amount}€ aplicada a ${getAdminName(c.id, c.phone) || c.name} ✓`, 'info');
-  renderClientsModal();
   // Refresh profile panel immediately if visible
   if (APP.currentPage === 'profile') { const _mc = document.getElementById('mainContent'); if (_mc) _mc.innerHTML = renderProfile(); }
 }
@@ -8167,7 +8338,7 @@ function initAdminSchedule() {
     const s = APP.db.schedule[i];
     const _open = (i in _scheduleDraftOpen) ? _scheduleDraftOpen[i] : s.open;
     html += `<div class="day-row" id="dayRow${i}">
-      <div class="day-toggle ${_open?'on':''}" onclick="toggleDay(${i})" id="dayToggle${i}"></div>
+      <div class="day-toggle ${_open?'on':''}" onclick="toggleDay(${i})" id="dayToggle${i}" aria-label="Abrir o cerrar ${days[i]}"${_KBD_BTN}></div>
       <div class="day-name">${days[i]}</div>
       <div class="day-hours" id="dayHours${i}" style="${_open?'':'display:none'}">
         ${makeTimeSelect('dayStart'+i, s.start)}
@@ -8360,7 +8531,7 @@ function onAlertTypeChange() {
     priceSection.style.display = type === 'PRECIO' ? 'block' : 'none';
     if (type === 'PRECIO') {
       const cpd = document.getElementById('currentPriceDisplay');
-      if (cpd) cpd.textContent = (APP.db.cutPrice || 10) + '€';
+      if (cpd) cpd.textContent = getEffectivePrice() + '€';
     }
   }
   const normaSection = document.getElementById('normaAlertSection');
@@ -8413,9 +8584,9 @@ function renderClosureCalendarModal() {
     ${closureState.to ? ` → Hasta: <strong style="color:var(--gold)">${closureState.to}</strong>` : ''}
   </div>
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-    <div class="cal-nav-btn" onclick="closureCalNav(-1)">‹</div>
+    <div class="cal-nav-btn" onclick="closureCalNav(-1)"${_KBD_BTN} aria-label="Mes anterior">‹</div>
     <div style="font-weight:700;font-size:1rem">${months[m].toUpperCase()} ${y}</div>
-    <div class="cal-nav-btn" onclick="closureCalNav(1)">›</div>
+    <div class="cal-nav-btn" onclick="closureCalNav(1)"${_KBD_BTN} aria-label="Mes siguiente">›</div>
   </div>
   <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px;margin-bottom:16px">`;
   days.forEach(d => cal += `<div style="text-align:center;font-size:0.7rem;color:var(--text3);padding:3px 0;font-weight:600">${d}</div>`);
@@ -8432,7 +8603,7 @@ function renderClosureCalendarModal() {
     else if (isFrom || isTo) style += 'background:var(--gold);color:#0a0a0a;font-weight:700;';
     else if (inRange) style += 'background:var(--gold-dim);color:var(--gold);';
     else style += 'color:var(--text2);';
-    if (!isPast) cal += `<div style="${style}" onclick="closureSelectDate('${dateStr}')">${d}</div>`;
+    if (!isPast) cal += `<div style="${style}" onclick="closureSelectDate('${dateStr}')"${_KBD_BTN}>${d}</div>`;
     else cal += `<div style="${style}">${d}</div>`;
   }
   cal += `</div>`;
@@ -8568,9 +8739,9 @@ function renderPriceCalModal() {
     ${_priceCalState.to ? ` → Hasta: <strong style="color:var(--gold)">${_priceCalState.to}</strong>` : ''}
   </div>
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-    <div class="cal-nav-btn" onclick="priceCalNav(-1)">‹</div>
+    <div class="cal-nav-btn" onclick="priceCalNav(-1)"${_KBD_BTN} aria-label="Mes anterior">‹</div>
     <div style="font-weight:700;font-size:1rem">${months[m].toUpperCase()} ${y}</div>
-    <div class="cal-nav-btn" onclick="priceCalNav(1)">›</div>
+    <div class="cal-nav-btn" onclick="priceCalNav(1)"${_KBD_BTN} aria-label="Mes siguiente">›</div>
   </div>
   <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px;margin-bottom:14px">`;
   days.forEach(d => cal += `<div style="text-align:center;font-size:0.7rem;color:var(--text3);padding:3px 0;font-weight:600">${d}</div>`);
@@ -8587,7 +8758,7 @@ function renderPriceCalModal() {
     else if (isFrom || isTo) style += 'background:var(--gold);color:#0a0a0a;font-weight:700;';
     else if (inRange) style += 'background:var(--gold-dim);color:var(--gold);';
     else style += 'color:var(--text2);';
-    if (!isPast) cal += `<div style="${style}" onclick="priceCalSelect('${dateStr}')">${d}</div>`;
+    if (!isPast) cal += `<div style="${style}" onclick="priceCalSelect('${dateStr}')"${_KBD_BTN}>${d}</div>`;
     else cal += `<div style="${style}">${d}</div>`;
   }
   cal += `</div>`;
@@ -9214,6 +9385,11 @@ function startRealTimeSync() {
           timeoutMs: 30000,
           silent: true
         });
+        // FIX: base borrada en otro dispositivo (data = {}) — ver _handleRemoteReset().
+        if (!_remoteDBEmpty && APP.db.adminPin && Array.isArray(rows) && rows.length > 0 && _isEmptyRemoteData(rows[0].data)) {
+          _handleRemoteReset();
+          return;
+        }
       }
       // FIX: un guardado local pudo empezar MIENTRAS esta lectura estaba en vuelo
       // (hasta 12s en redes lentas). Volver a comprobarlo para no pisar con este
@@ -9255,6 +9431,7 @@ function startRealTimeSync() {
             const localArr = Array.isArray(localClients) ? localClients : [];
             const remoteClientsById = new Map(remoteClients.map(c => [c.id, c]));
             const _histBase = _cutHistBaseMap();
+            const _clientBase = _clientBaseMap();
             // FIX: igual que en _pushDBToSupabase(): un cliente ya sincronizado que falta en
             // remoto fue eliminado en otro dispositivo — quitarlo aquí también (así funciona la
             // expulsión de sesión de abajo y no se resucita en el siguiente guardado).
@@ -9288,6 +9465,7 @@ function startRealTimeSync() {
               if (typeof rc.totalCuts === 'number' && rc.totalCuts > (merged2.totalCuts || 0)) {
                 merged2.totalCuts = rc.totalCuts;
               }
+              _takeRemoteClientFields(merged2, lc, rc, _clientBase);
               return merged2;
             });
             const localClientIds = new Set(localArr.map(c => c.id));
@@ -9299,7 +9477,7 @@ function startRealTimeSync() {
           // es más avanzado que el remoto (accepted/rejected > pending). Evita que un
           // snapshot antiguo de Supabase restaure a pending una solicitud ya resuelta localmente.
           const statusRank = { pending: 0, accepted: 1, rejected: 1 };
-          const mergeByStatus = (remoteArr, localArr) => {
+          const mergeByStatus = (remoteArr, localArr, kind) => {
             if (!Array.isArray(remoteArr)) return Array.isArray(localArr) ? localArr : [];
             const localById = new Map((localArr || []).map(r => [r.id, r]));
             const merged = remoteArr.map(r => {
@@ -9310,7 +9488,9 @@ function startRealTimeSync() {
               return r;
             });
             // Añadir los que solo están en local (creados pero aún no subidos)
-            (localArr || []).forEach(loc => { if (!merged.find(r => r.id === loc.id)) merged.push(loc); });
+            // FIX: salvo los ya sincronizados que faltan en remoto (eliminados en otro dispositivo),
+            // igual que mergeClients; si no, se conservaban aquí y el siguiente guardado los resucitaba.
+            (localArr || []).forEach(loc => { if (!merged.find(r => r.id === loc.id) && !_wasSyncedAndRemoved(kind, loc.id)) merged.push(loc); });
             return merged;
           };
           APP.db = {
@@ -9321,12 +9501,12 @@ function startRealTimeSync() {
             notifications: safeMergeArr(remote.notifications, APP.db.notifications),
             alerts: safeMergeArr(remote.alerts, APP.db.alerts),
             allowedPhones: safeMergeArr(remote.allowedPhones, APP.db.allowedPhones),
-            oohRequests: mergeByStatus(remote.oohRequests, APP.db.oohRequests),
+            oohRequests: mergeByStatus(remote.oohRequests, APP.db.oohRequests, 'oohRequests'),
             lateChecks: safeMergeArr(remote.lateChecks, APP.db.lateChecks),
             blockedDays: safeMergeArr(remote.blockedDays, APP.db.blockedDays),
             blockedSlots: safeMergeArr(remote.blockedSlots, APP.db.blockedSlots),
             cancelWaitlist: safeMergeArr(remote.cancelWaitlist, APP.db.cancelWaitlist),
-            swapRequests: mergeByStatus(remote.swapRequests, APP.db.swapRequests),
+            swapRequests: mergeByStatus(remote.swapRequests, APP.db.swapRequests, 'swapRequests'),
             normas: remote.normas || APP.db.normas,
             pushSubscriptions: remote.pushSubscriptions || APP.db.pushSubscriptions || {},
             // Always sync admin credentials from remote so PIN changes on one device
@@ -9337,6 +9517,7 @@ function startRealTimeSync() {
             adminPhone: remote.adminPhone || APP.db.adminPhone,
           };
           _lastRemoteUpdatedAt = remoteTs || _lastRemoteUpdatedAt;
+          if (remote.adminPin) _remoteDBEmpty = false; // otro dispositivo ya configuró la base
           _lastSyncedIds = _snapshotSyncedIds(APP.db);
           _lastSyncedFines = _snapshotSyncedFines(remote.clients);
           _lastSyncedData = _snapshotSyncedData(remote);
@@ -9349,6 +9530,19 @@ function startRealTimeSync() {
         // Always check user validity after sync (even if we didn't apply remote data,
         // the user could have been deleted by admin on another device before our last push)
         if (!APP.isAdmin && APP.currentUser) {
+          // FIX: acceso visual desactivado (o usuario/código cambiado) por el barbero → cerrar la
+          // sesión del visor. Solo con datos ya sincronizados con el servidor (_lastRemoteUpdatedAt),
+          // nunca con una copia local antigua. Sesiones anteriores sin "code" solo comparan usuario.
+          if (APP.isViewer && APP.currentUser.id === '_viewer' && APP.db.adminPin && _lastRemoteUpdatedAt &&
+              !(APP.db.viewerUser && APP.db.viewerCode &&
+                String(APP.currentUser.name || '').toLowerCase() === String(APP.db.viewerUser).toLowerCase() &&
+                (APP.currentUser.code === undefined || APP.currentUser.code === APP.db.viewerCode))) {
+            clearSession();
+            APP.currentUser = null;
+            APP.isViewer = false;
+            showScreen('screen-login');
+            return;
+          }
           const stillExists = APP.db.clients && APP.db.clients.find(c => c.id === APP.currentUser.id);
           // Skip kick-out for viewer — '_viewer' is not a real client entry
           if (!stillExists && APP.db.clients && APP.db.adminPin && APP.currentUser.id !== '_viewer') {
@@ -9393,7 +9587,19 @@ function startRealTimeSync() {
                 (document.activeElement.tagName === 'INPUT' ||
                  document.activeElement.tagName === 'TEXTAREA' ||
                  document.activeElement.tagName === 'SELECT');
-              if (!focusedInMainContent) {
+              // FIX: además del foco, no re-renderizar si algún campo de mainContent tiene
+              // cambios sin guardar (valor distinto del pintado). Sin foco (p.ej. tras elegir
+              // las fechas de cierre en su modal o tras escribir el mensaje y tocar fuera),
+              // renderAdmin() devolvía el formulario "Publicar alerta" y el horario a cero.
+              const unsavedInMainContent = Array.prototype.some.call(mc.querySelectorAll('input, textarea, select'), el => {
+                if (el.tagName === 'SELECT') {
+                  const def = Array.prototype.find.call(el.options, o => o.defaultSelected) || el.options[0];
+                  return !!def && el.value !== def.value;
+                }
+                if (el.type === 'checkbox' || el.type === 'radio') return el.checked !== el.defaultChecked;
+                return el.value !== el.defaultValue;
+              });
+              if (!focusedInMainContent && !unsavedInMainContent) {
                 // FIX: preserve cutsCalendar open/closed state on profile page before re-rendering
                 const cutsCalOpen = APP.currentPage === 'profile' &&
                   document.getElementById('cutsCalContainer') &&
@@ -9414,10 +9620,11 @@ function startRealTimeSync() {
               }
             } else if (mc && APP.currentPage === 'book') {
               // Only refresh admin booking calendar silently on step 1 (calendar view)
-              if (APP.isAdmin && bookState && bookState.step === 1) {
+              // FIX: el visor (solo lectura) también: si no, nunca veía los datos sincronizados.
+              if ((APP.isAdmin || APP.isViewer) && bookState && bookState.step === 1) {
                 const bc = document.getElementById('bookContainer');
                 if (bc) bc.innerHTML = renderCalendar();
-              } else if (APP.isAdmin && bookState && bookState.step === 4 && bookState.date) {
+              } else if ((APP.isAdmin || APP.isViewer) && bookState && bookState.step === 4 && bookState.date) {
                 // Also refresh admin agenda day view on sync (appointments may have changed)
                 const bc = document.getElementById('bookContainer');
                 const focusedInAgenda = document.activeElement && document.activeElement.closest && document.activeElement.closest('#bookContainer');
@@ -9480,7 +9687,7 @@ function check24hReminders() {
     const apptTime = new Date(y, mo-1, d, h, m, 0, 0);
     const hoursLeft = (apptTime - now) / 3600000;
     if (hoursLeft <= 24 && hoursLeft > 0) {
-      addNotif(appt.clientId, `⏰ <strong>Recordatorio:</strong><br>Tienes cita mañana a las <strong>${appt.time}</strong>.`);
+      addNotif(appt.clientId, `⏰ <strong>Recordatorio:</strong><br>Tienes cita ${appt.date === todayStr() ? 'hoy' : 'mañana'} a las <strong>${appt.time}</strong>.`);
       // Also fire server-side push in case client has push enabled but app was closed
       // (scheduleReminderPush is idempotent — safe to call even if already scheduled)
       _scheduleReminderPush(appt);
@@ -9539,6 +9746,15 @@ function checkDailyReset() {
     addAlertBroadcast('PRECIO', `El precio del corte ha vuelto a <strong>${orig}€</strong>.`);
     // NOTE: don't call saveDB() here — the final saveDB() at the end of this function handles it
   }
+
+  // FIX: citas de días anteriores que siguen 'pending'/'confirmed' (la app del barbero no estaba
+  // abierta a los 15 min de la cita, cuando _runLateCheck las da por realizadas). El filtro de
+  // más abajo borra todas las citas pasadas, pero el archivo solo recoge done/late/no-show: estas
+  // se perdían sin pasar a cutHistory (fuera del historial y de las ganancias). Misma regla que
+  // _runLateCheck (≥15 min sin respuesta → realizada); se pueden corregir luego desde la Agenda.
+  APP.db.appointments.forEach(appt => {
+    if (appt.date < today && ['pending','confirmed'].includes(appt.status)) appt.status = 'done';
+  });
 
   // Archive done/late/no-show appointments into client cut history, then remove from admin history
   APP.db.appointments.forEach(appt => {
@@ -9712,11 +9928,11 @@ function checkSwapAutoReject() {
     addNotif(req.fromClientId, `❌ Tu solicitud de cambio de hora el ${formatDateHuman(req.date)} ha sido <strong>rechazada automáticamente</strong> por quedar menos de 24h para la cita. Tu cita sigue siendo a las <strong>${origTime}</strong>.`);
     const toApptCSA = APP.db.appointments.find(a => a.id === req.toApptId);
     if (toApptCSA) {
-      addNotif(toApptCSA.clientId, `⌛ La solicitud de cambio de hora de <strong>${escHtml(req.fromClientName||'')}</strong> el ${formatDateHuman(req.date)} ha expirado automáticamente por quedar menos de 24h para la cita.`);
+      addNotif(toApptCSA.clientId, `⌛ La solicitud de cambio de hora de <strong>${req.fromClientName||''}</strong> el ${formatDateHuman(req.date)} ha expirado automáticamente por quedar menos de 24h para la cita.`);
     }
     const _reqClientCSA = APP.db.clients.find(c => c.id === req.fromClientId);
     const _reqNameCSA = _reqClientCSA ? (getAdminName(_reqClientCSA.id, _reqClientCSA.phone) || _reqClientCSA.name) : req.fromClientName;
-    addNotif('admin', `⌛ El cambio de hora solicitado por <strong>${escHtml(_reqNameCSA)}</strong> el ${formatDateHuman(req.date)} fue rechazado automáticamente (menos de 24h para la cita).`);
+    addNotif('admin', `⌛ El cambio de hora solicitado por <strong>${_reqNameCSA}</strong> el ${formatDateHuman(req.date)} fue rechazado automáticamente (menos de 24h para la cita).`);
     changed = true;
   });
   if (changed) saveDB(); // only save if something actually changed
@@ -9814,13 +10030,119 @@ async function registerPush() {
     if (!APP.db.pushSubscriptions) APP.db.pushSubscriptions = {};
     APP.db.pushSubscriptions[userId] = sub.toJSON();
     _intentionallyRemovedPushSubs.delete(userId);
+    try { localStorage.setItem(_PUSH_DEVICE_KEY + userId, sub.endpoint); } catch(e) {}
     saveDB();
+    _afterPushSubChanged(userId);
+    _updatePushStatusUI();
     showToast('✅ Notificaciones push activadas', 'success');
   } catch(e) {
     console.error('registerPush error:', e);
     showToast('Error activando notificaciones: ' + e.message, 'error');
   }
 }
+
+// =============================================
+// PUSH — estado en el perfil y reparación automática
+// El móvil/navegador puede invalidar o renovar la suscripción push sin avisar; la guardada en
+// Supabase deja de servir y no llegan notificaciones. Al abrir la app (o volver a ella) se
+// comprueba y, si hace falta, se guarda la suscripción actual de este móvil.
+// =============================================
+const _PUSH_DEVICE_KEY = 'barberbook_push_endpoint_'; // + userId → endpoint que guardó ESTE móvil
+let _pushAutoSyncBusy = false;
+let _pushAutoSyncLast = 0;
+
+function _pushUserId() { return APP.isAdmin ? 'admin' : (APP.currentUser && APP.currentUser.id || ''); }
+function _pushSupported() { return ('serviceWorker' in navigator) && ('PushManager' in window) && (typeof Notification !== 'undefined'); }
+
+// Las filas ya programadas en el servidor llevan la suscripción antigua: actualizarlas.
+function _afterPushSubChanged(userId) {
+  try {
+    if (userId === 'admin') { _refreshLateCheckSub(); return; }
+    const today = todayStr();
+    (APP.db.appointments || []).forEach(a => {
+      if (a.clientId === userId && a.date >= today && ['pending','confirmed'].includes(a.status)) _scheduleReminderPush(a);
+    });
+  } catch(e) {}
+}
+
+async function _autoSyncPushSub(force) {
+  if (_pushAutoSyncBusy || !_pushSupported()) return;
+  if (!APP.currentUser || APP.isViewer || APP._adminSession || !APP.db.adminPin) return;
+  // Sin permiso concedido no se pregunta nada: solo se muestra el aviso del perfil.
+  if (Notification.permission !== 'granted') { _updatePushStatusUI(); return; }
+  if (!force && Date.now() - _pushAutoSyncLast < 60000) return;
+  _pushAutoSyncBusy = true;
+  _pushAutoSyncLast = Date.now();
+  try {
+    const userId = _pushUserId();
+    if (!userId) return;
+    const subOpts = { userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY) };
+    const reg = await _getOrRegisterSW();
+    await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe(subOpts);
+    if (!sub) return;
+    let mine = null;
+    try { mine = localStorage.getItem(_PUSH_DEVICE_KEY + userId); } catch(e) {}
+    const stored = APP.db.pushSubscriptions && APP.db.pushSubscriptions[userId];
+    const storedEp = stored && stored.endpoint;
+    if (storedEp === sub.endpoint) { // todo correcto
+      try { localStorage.setItem(_PUSH_DEVICE_KEY + userId, sub.endpoint); } catch(e) {}
+      return;
+    }
+    // La guardada es de OTRO móvil del mismo usuario (la registró él): no quitársela.
+    if (storedEp && mine && storedEp !== mine) return;
+    // La guardada se borró (p.ej. el servidor la rechazó por caducada) y este móvil sigue con la
+    // misma: pedir una nueva en vez de volver a guardar una que ya no funciona.
+    if (!storedEp && mine && mine === sub.endpoint) {
+      try { await sub.unsubscribe(); } catch(e) {}
+      sub = await reg.pushManager.subscribe(subOpts);
+      if (!sub) return;
+    }
+    if (!APP.db.pushSubscriptions) APP.db.pushSubscriptions = {};
+    APP.db.pushSubscriptions[userId] = sub.toJSON();
+    _intentionallyRemovedPushSubs.delete(userId);
+    try { localStorage.setItem(_PUSH_DEVICE_KEY + userId, sub.endpoint); } catch(e) {}
+    saveDB();
+    _afterPushSubChanged(userId);
+  } catch(e) {
+    console.warn('_autoSyncPushSub error:', e);
+  } finally {
+    _pushAutoSyncBusy = false;
+    _updatePushStatusUI();
+  }
+}
+
+// Rellena el recuadro #pushStatus del perfil con el estado real de las notificaciones de este móvil.
+let _pushStatusSeq = 0; // solo pinta la comprobación más reciente (son asíncronas)
+async function _updatePushStatusUI() {
+  const el = document.getElementById('pushStatus');
+  if (!el) return;
+  const seq = ++_pushStatusSeq;
+  // "Ver perfil" (admin viendo como cliente): el estado sería el del móvil del barbero.
+  if (APP._adminSession || APP.isViewer) { el.innerHTML = ''; return; }
+  const set = (color, text) => {
+    if (seq !== _pushStatusSeq) return;
+    const e2 = document.getElementById('pushStatus');
+    if (e2) e2.innerHTML = '<div role="status" style="font-size:0.8rem;line-height:1.4;color:' + color + ';text-align:center;padding:8px 10px;border:1px solid ' + color + ';border-radius:8px">' + text + '</div>';
+  };
+  if (!_pushSupported()) { set('var(--text3)', 'Este móvil no admite notificaciones push.'); return; }
+  const perm = Notification.permission;
+  if (perm === 'denied') { set('var(--red)', '⚠️ Notificaciones bloqueadas en los ajustes del móvil. Actívalas allí para recibir avisos.'); return; }
+  if (perm !== 'granted') { set('var(--red)', '⚠️ Notificaciones desactivadas. Pulsa el botón de abajo para activarlas.'); return; }
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    const sub = reg ? await reg.pushManager.getSubscription() : null;
+    const stored = APP.db.pushSubscriptions && APP.db.pushSubscriptions[_pushUserId()];
+    if (sub && stored && stored.endpoint === sub.endpoint) { set('var(--green)', '✅ Notificaciones activas en este móvil.'); return; }
+  } catch(e) {}
+  set('var(--red)', '⚠️ Tus notificaciones no funcionan en este móvil. Pulsa el botón de abajo para reactivarlas.');
+}
+
+// Al volver a la app desde segundo plano también se comprueba (como mucho una vez por minuto).
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') _autoSyncPushSub();
+});
 
 // FIX timezone bug: the previous offset calculation re-parsed a toLocaleString()
 // output with `new Date(...)`, which JS interprets using the *runtime's own*
@@ -10057,7 +10379,9 @@ function showNotifications() {
     });
   }
   // Mark all read
-  const _anyUnread = notifs.some(n => !n.read);
+  // FIX: en "Ver perfil" (admin viendo como cliente, modo vista) no marcar como leídas las
+  // notificaciones del cliente: se guardaban y el cliente real ya no las veía como nuevas.
+  const _anyUnread = !APP._adminSession && notifs.some(n => !n.read);
   if (_anyUnread) {
     notifs.forEach(n => n.read = true);
     saveDB();
@@ -10067,6 +10391,7 @@ function showNotifications() {
 }
 
 function markRead(id) {
+  if (APP._adminSession) return; // modo vista: no modificar datos del cliente
   const n = APP.db.notifications.find(n => n.id === id);
   if (n) { n.read = true; saveDB(); }
 }
@@ -10085,6 +10410,9 @@ document.addEventListener('touchmove', function(e) {
 }, { passive: false });
 
 let _modalScrollLockY = 0;
+// FIX: quien hace scroll es la ventana (.main-content no tiene altura fija), no .main-content.
+// Con top='0' el fondo saltaba arriba al abrir cualquier modal y no volvía al cerrarlo.
+let _modalWinScrollY = 0;
 function openModal(title, body) {
   document.getElementById('modalTitle').textContent = title;
   document.getElementById('modalBody').innerHTML = body;
@@ -10093,8 +10421,10 @@ function openModal(title, body) {
   // (bug conocido de Safari). El método que sí funciona es fijar la posición del body.
   const _mc = document.querySelector('.main-content');
   _modalScrollLockY = _mc ? _mc.scrollTop : (window.scrollY || 0);
+  // Solo al bloquear por primera vez: con un modal ya abierto (body fijo) scrollY vale 0.
+  if (document.body.style.position !== 'fixed') _modalWinScrollY = window.scrollY || window.pageYOffset || 0;
   document.body.style.position = 'fixed';
-  document.body.style.top = '0';
+  document.body.style.top = (-_modalWinScrollY) + 'px';
   document.body.style.left = '0';
   document.body.style.right = '0';
   document.body.style.width = '100%';
@@ -10103,6 +10433,7 @@ function openModal(title, body) {
 function closeModal(e) {
   if (!e || e.target === document.getElementById('modal')) {
     document.getElementById('modal').classList.remove('open');
+    const _wasLocked = document.body.style.position === 'fixed';
     document.body.style.position = '';
     document.body.style.top = '';
     document.body.style.left = '';
@@ -10110,6 +10441,14 @@ function closeModal(e) {
     document.body.style.width = '';
     const _mc = document.querySelector('.main-content');
     if (_mc) { _mc.style.overflow = ''; _mc.style.touchAction = ''; _mc.scrollTop = _modalScrollLockY; }
+    // Volver a la posición de la ventana sin animación (html tiene scroll-behavior: smooth).
+    if (_wasLocked) {
+      const _html = document.documentElement;
+      const _prevSB = _html.style.scrollBehavior;
+      _html.style.scrollBehavior = 'auto';
+      window.scrollTo(0, _modalWinScrollY);
+      _html.style.scrollBehavior = _prevSB;
+    }
     if (window._cancelTick) { clearInterval(window._cancelTick); window._cancelTick = null; }
   }
 }
@@ -10181,7 +10520,7 @@ function assignClientToFine(fineIdx) {
       ? filtered.map(c => {
           const name = escHtml(getAdminName(c.id, c.phone) || c.name);
           return `<div style="padding:10px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:0.88rem;font-weight:600;color:var(--text)"
-            onclick="doAssignClientToFine('${fineIdx}', '${c.id}')">${name}</div>`;
+            onclick="doAssignClientToFine('${fineIdx}', '${c.id}')"${_KBD_BTN}>${name}</div>`;
         }).join('')
       : '<div style="text-align:center;color:var(--text3);font-size:0.85rem;padding:16px">Sin resultados</div>';
   };
@@ -10317,7 +10656,7 @@ function formatNotifMsg(msg) {
   // 1. Allowing a strict allowlist of tags our own code produces.
   // 2. Validating style attributes against a CSS property whitelist.
   // 3. Escaping everything else.
-  const CSS_SAFE = /^(color|font-weight|font-size|text-decoration|border|border-radius|background|padding|margin|display|align-items|justify-content|gap|text-align|min-width|flex|font-family|letter-spacing|width|height)\s*:\s*[a-zA-Z0-9#(),./\s%_'-]+$/;
+  const CSS_SAFE = /^(color|font-weight|font-size|text-decoration|border|border-left|border-radius|background|padding|margin|display|align-items|justify-content|gap|text-align|min-width|flex|font-family|letter-spacing|width|height)\s*:\s*[a-zA-Z0-9#(),./\s%_'-]+$/;
   // PRE-SANITIZE href BEFORE splitting: remove any href whose scheme is not in the allowlist.
   // This must happen BEFORE TAG_RE splits the string, because if the href value contains "<",
   // TAG_RE cuts the tag short and leaves the href value unmatched by subsequent regexes.
@@ -10334,37 +10673,33 @@ function formatNotifMsg(msg) {
     const tagName = (p.match(/^<\/?([a-z]+)/i) || [])[1] || '';
     const allowed = ['strong','br','em','b','div','span','a'].includes(tagName.toLowerCase());
     if (!allowed) return escHtml(p);
-    // Closing tags are safe as-is
-    if (/^<\//.test(p)) return p;
-    // Validate style attribute
-    const styleMatch = p.match(/style="([^"]*)"/i);
+    // FIX XSS: las etiquetas permitidas se RECONSTRUYEN en vez de filtrarse atributo a atributo.
+    // Los mensajes sí incluyen texto del usuario (el nombre con el que se registra un cliente va
+    // tal cual dentro de <strong> en "Nueva cita", cancelaciones, etc.) y el filtro anterior se
+    // podía saltar: href sin comillas o con comillas simples (href=javascript:...), manejadores
+    // pegados a una comilla o a "/" (title="x"onclick=..., x/onmouseover=...), y cualquier
+    // on* sobrevivía si el style no pasaba la validación (se devolvía la etiqueta antes de limpiarla).
+    // Ahora solo salen el nombre de la etiqueta, style (validado) y, en <a>, href con esquema seguro
+    // y target="_blank". El propio código solo usa style en sus notificaciones.
+    const _tn = tagName.toLowerCase();
+    if (/^<\//.test(p)) return '</' + _tn + '>';
+    let rebuilt = '<' + _tn;
+    const styleMatch = p.match(/\sstyle="([^"]*)"/i);
     if (styleMatch) {
       const props = styleMatch[1].split(';').map(s => s.trim()).filter(Boolean);
-      if (!props.every(prop => CSS_SAFE.test(prop))) {
-        // Strip the style attribute but keep the tag
-        return p.replace(/\s*style="[^"]*"/i, '');
-      }
+      if (props.every(prop => CSS_SAFE.test(prop))) rebuilt += ' style="' + styleMatch[1] + '"';
     }
-    // Strip any dangerous attributes (onclick, onerror, etc.) — keep only style and safe href (for <a>)
-    // FIX: para <a>, extraemos el atributo href antes de que el parser pueda ver HTML escapado dentro.
-    // Estrategia: cualquier href que no empiece por un esquema seguro es eliminado completamente.
-    // Como los mensajes de notificación son generados por nuestro propio código (no por el usuario),
-    // los hrefs legítimos siempre serán https://, mailto: o tel:.
-    let stripped = p.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
-    if (tagName.toLowerCase() === 'a') {
-      // Extraemos el valor del href antes de que escaping interno lo enmascare
-      const hrefRaw = p.match(/\s+href\s*=\s*"([^"]*)"/i);
+    if (_tn === 'a') {
+      const hrefRaw = p.match(/\shref="([^"]*)"/i);
       if (hrefRaw) {
         const val = hrefRaw[1].trim().toLowerCase();
         const scheme = val.split(':')[0].replace(/[^a-z]/g, ''); // solo letras
         const safeschemes = ['https', 'http', 'mailto', 'tel', ''];
-        if (!safeschemes.includes(scheme)) {
-          // Esquema peligroso → eliminar href completamente
-          stripped = stripped.replace(/\s+href\s*=\s*"[^"]*"/gi, '');
-        }
+        if (safeschemes.includes(scheme)) rebuilt += ' href="' + hrefRaw[1] + '"';
       }
+      if (/\starget="_blank"/i.test(p)) rebuilt += ' target="_blank" rel="noopener"';
     }
-    return stripped;
+    return rebuilt + '>';
   }).join('');
   // Convert raw dates like "2026-05-05" to human format — only when clearly a date in context
   // Uses a capturing group approach instead of lookbehind for full Safari compatibility
