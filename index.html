@@ -7277,6 +7277,10 @@ function renderClientList(filter, sortMode) {
   const sort = sortMode || 'alpha';
   const blockedOnly = sort === 'blocked';
   const pushOnly = sort === 'push';
+  // 💰 Dinero por cliente — solo el barbero (admin)
+  const moneyOnly = sort === 'money' && !!APP.isAdmin;
+  const moneyById = new Map();
+  if (moneyOnly) APP.db.clients.forEach(c => moneyById.set(c.id, _clientMoneyBreakdown(c)));
   const pushSubs = APP.db.pushSubscriptions || {};
   let html = '';
 
@@ -7309,6 +7313,13 @@ function renderClientList(filter, sortMode) {
       const dB4 = (nameB4 && typeof nameB4 === 'object' && nameB4.name) ? nameB4.name : b.name;
       return dA4.localeCompare(dB4, 'es', { sensitivity: 'base' });
     }
+    if (moneyOnly) {
+      const tA = moneyById.get(a.id).total, tB = moneyById.get(b.id).total;
+      if (tA !== tB) return tB - tA; // quien más ha pagado, arriba
+      const dA5 = getAdminName(a.id, a.phone) || a.name || '';
+      const dB5 = getAdminName(b.id, b.phone) || b.name || '';
+      return dA5.localeCompare(dB5, 'es', { sensitivity: 'base' });
+    }
     // sort by last cut date + time
     const lcA = getClientLastCut(a);
     const lcB = getClientLastCut(b);
@@ -7337,17 +7348,20 @@ function renderClientList(filter, sortMode) {
         <div class="client-phone">${escHtml(c.phone)}</div>
         ${lastCutHtml}
       </div>
-      <div style="display:flex;gap:6px;align-items:center">
+      ${moneyOnly ? `<div style="display:flex;gap:6px;align-items:center">
+        <div style="font-family:'Courier New',monospace;font-weight:700;font-size:0.95rem;white-space:nowrap;color:${moneyById.get(c.id).total > 0 ? 'var(--green)' : 'var(--text3)'}">${_fmtTipEuro(moneyById.get(c.id).total)}€</div>
+        <button class="btn btn-ghost btn-sm" style="width:auto;padding:2px 8px;font-size:0.85rem;border-color:var(--border2);color:var(--text2)" onclick="openClientMoneyDetail('${c.id}')" title="Ver detalle de pagos" aria-label="Ver detalle de pagos">📋</button>
+      </div>` : `<div style="display:flex;gap:6px;align-items:center">
         ${hasPush ? `<div class="appt-btn" style="border-color:var(--gold);color:var(--gold);background:var(--gold-dim);cursor:default" title="Notificaciones push activadas">🔔</div>` : ''}
         <button class="btn btn-ghost btn-sm" style="width:auto;padding:2px 10px;font-size:1rem;letter-spacing:2px;border-color:var(--border2);color:var(--text2)" onclick="openClientMenu('${c.id}')">···</button>
-      </div>
+      </div>`}
     </div>`;
   });
 
   // --- Unregistered (pending) phones — shown at the bottom, also filtered ---
   // Skipped entirely in the "blocked" and "push" filters: unregistered phones have no
   // client record, so they can never be blocked nor have a push subscription.
-  if (!blockedOnly && !pushOnly) APP.db.allowedPhones.forEach((entry, idx) => {
+  if (!blockedOnly && !pushOnly && !moneyOnly) APP.db.allowedPhones.forEach((entry, idx) => {
     const phone = typeof entry === 'object' ? entry.phone : entry;
     const adminName = typeof entry === 'object' ? entry.name : '';
     const registered = APP.db.clients.find(c => normalizePhone(c.phone) === normalizePhone(phone) || barePhone(c.phone) === barePhone(phone) || (digitsOnly(c.phone).slice(-9) === digitsOnly(phone).slice(-9) && digitsOnly(phone).length >= 9));
@@ -7372,7 +7386,96 @@ function renderClientList(filter, sortMode) {
   if (html) return html;
   if (blockedOnly) return `<div style="color:var(--text3);font-size:0.82rem;text-align:center;padding:16px">✅ No hay clientes bloqueados</div>`;
   if (pushOnly) return `<div style="color:var(--text3);font-size:0.82rem;text-align:center;padding:16px">🔕 Ningún cliente tiene las notificaciones push activadas</div>`;
+  if (moneyOnly && !q) return `<div style="color:var(--text3);font-size:0.82rem;text-align:center;padding:16px">Sin clientes registrados</div>`;
   return `<div style="color:var(--text3);font-size:0.82rem;text-align:center;padding:16px">Sin resultados para "${escHtml(q)}"</div>`;
+}
+
+// =============================================
+// 💰 DINERO POR CLIENTE (solo admin)
+// Mismas reglas que "Dinero ganado este mes" (renderCalendar), pero sumando todo el
+// historial de UN cliente: cortes realizados/llegó tarde (citas actuales + cutHistory,
+// sin contar dos veces la misma cita), multas incluidas en el corte, multas cobradas
+// aparte (finesPaidStandalone) y propinas (tipsStandalone) asignadas a ese cliente.
+// =============================================
+function _moneyPriceFromNote(note) {
+  if (!note) return null;
+  const m = note.match(/Total[^\d]*(\d+)€/i) || note.match(/\+(\d+)€/) || note.match(/(\d+)€/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function _moneyCutBreakdown(isOOH, amountPaid, bookedPrice, note, apptDate) {
+  const baseFromNote = _moneyPriceFromNote(note);
+  const basePrice = bookedPrice != null ? bookedPrice
+                  : baseFromNote != null ? baseFromNote
+                  : amountPaid != null ? amountPaid
+                  : isOOH ? (getEffectivePrice(apptDate) + 5) : getEffectivePrice(apptDate);
+  const totalPaid = amountPaid != null ? amountPaid : basePrice;
+  return { basePrice, fineInCut: Math.max(0, totalPaid - basePrice) };
+}
+
+function _clientMoneyBreakdown(c) {
+  const r = { normal: 0, nNormal: 0, ooh: 0, nOOH: 0, fines: 0, nFines: 0, tips: 0, nTips: 0, total: 0 };
+  if (!c) return r;
+  const addCut = (x) => {
+    const isOOH = !!(x.note && x.note.includes('Fuera de horario'));
+    const bd = _moneyCutBreakdown(isOOH, x.amountPaid, x.bookedPrice, x.note, x.date);
+    if (isOOH) { r.ooh += bd.basePrice; r.nOOH++; } else { r.normal += bd.basePrice; r.nNormal++; }
+    if (bd.fineInCut > 0) { r.fines += bd.fineInCut; r.nFines++; }
+  };
+  const appts = (APP.db.appointments || []).filter(a => a.clientId === c.id && ['done', 'late'].includes(a.status));
+  const counted = new Set(appts.map(a => a.id));
+  appts.forEach(addCut);
+  (c.cutHistory || []).forEach(h => {
+    if (!h || !['done', 'late'].includes(h.status)) return;
+    if (counted.has(h.apptId)) return; // ya contado desde appointments
+    if (!h.date) return;
+    addCut(h);
+  });
+  (APP.db.finesPaidStandalone || []).forEach(f => {
+    if (f && f.clientId === c.id) { r.fines += (Number(f.amount) || 0); r.nFines++; }
+  });
+  (APP.db.tipsStandalone || []).forEach(t => {
+    if (t && t.clientId === c.id) { r.tips += (Number(t.amount) || 0); r.nTips++; }
+  });
+  const round2 = n => Math.round(n * 100) / 100;
+  r.normal = round2(r.normal); r.ooh = round2(r.ooh); r.fines = round2(r.fines); r.tips = round2(r.tips);
+  r.total = round2(r.normal + r.ooh + r.fines + r.tips);
+  return r;
+}
+
+function openClientMoneyDetail(clientId) {
+  if (!APP.isAdmin) return; // solo el barbero
+  const c = APP.db.clients.find(x => x.id === clientId);
+  if (!c) return;
+  const name = getAdminName(c.id, c.phone) || c.name;
+  const b = _clientMoneyBreakdown(c);
+  const row = (icon, label, count, amount, color) => `
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:0.88rem;color:${color}">${icon} ${label} <span style="color:var(--text3);font-family:'Courier New',monospace;font-size:0.75rem">(${count})</span></div>
+      <div style="font-family:'Courier New',monospace;font-weight:700;font-size:0.92rem;color:${color}">${_fmtTipEuro(amount)}€</div>
+    </div>`;
+  const body = `
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${row('✂️', 'Cortes normales', b.nNormal, b.normal, 'var(--text)')}
+      ${row('🕐', 'Fuera de horario', b.nOOH, b.ooh, 'var(--blue)')}
+      ${row('💸', 'Multas', b.nFines, b.fines, 'var(--red)')}
+      ${row('🎁', 'Propinas', b.nTips, b.tips, 'var(--green)')}
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;border:1px solid var(--gold);border-radius:8px;margin-top:4px">
+        <div style="font-size:0.9rem;font-weight:700;color:var(--gold)">💰 Total pagado</div>
+        <div style="font-family:'Courier New',monospace;font-weight:700;font-size:1.05rem;color:var(--gold)">${_fmtTipEuro(b.total)}€</div>
+      </div>
+      <button class="btn btn-ghost" style="margin-top:8px" onclick="_backToClientMoney()">← Volver</button>
+    </div>`;
+  openModal('💰 ' + name, body);
+}
+
+function _backToClientMoney() {
+  closeModal();
+  renderClientsModal();
+  const sel = document.getElementById('clientSortMode');
+  if (sel) sel.value = 'money';
+  filterClientList();
+  _highlightClientSort('sortMoney');
 }
 
 function filterClientList() {
@@ -7397,6 +7500,7 @@ function renderClientsModal() {
       <button id="sortOldest" class="btn btn-ghost btn-sm" style="flex:1;font-size:0.72rem" onclick="document.getElementById('clientSortMode').value='oldest';filterClientList();_highlightClientSort('sortOldest')">✂️ Más antiguo</button>
       <button id="sortPush" class="btn btn-ghost btn-sm" style="flex:1;font-size:0.72rem" onclick="document.getElementById('clientSortMode').value='push';filterClientList();_highlightClientSort('sortPush')" title="Ver quién tiene notificaciones push activadas">🔔</button>
       <button id="sortBlocked" class="btn btn-ghost btn-sm" style="flex:1;font-size:0.72rem" onclick="document.getElementById('clientSortMode').value='blocked';filterClientList();_highlightClientSort('sortBlocked')">🚫</button>
+      ${APP.isAdmin ? `<button id="sortMoney" class="btn btn-ghost btn-sm" style="flex:1;font-size:0.72rem" onclick="document.getElementById('clientSortMode').value='money';filterClientList();_highlightClientSort('sortMoney')" title="Ver cuánto ha pagado cada cliente" aria-label="Ver cuánto ha pagado cada cliente">💰</button>` : ''}
     </div>
     <select id="clientSortMode" style="display:none">
       <option value="alpha">alpha</option>
@@ -7404,6 +7508,7 @@ function renderClientsModal() {
       <option value="oldest">oldest</option>
       <option value="push">push</option>
       <option value="blocked">blocked</option>
+      <option value="money">money</option>
     </select>
     <div id="clientList" style="margin-bottom:12px">${renderClientList()}</div>
     <div class="divider"></div>
@@ -7420,7 +7525,7 @@ function renderClientsModal() {
 }
 
 function _highlightClientSort(activeId) {
-  ['sortAlpha','sortRecent','sortOldest','sortPush','sortBlocked'].forEach(id => {
+  ['sortAlpha','sortRecent','sortOldest','sortPush','sortBlocked','sortMoney'].forEach(id => {
     const btn = document.getElementById(id);
     if (!btn) return;
     if (id === activeId) {
